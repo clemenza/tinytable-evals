@@ -26,6 +26,11 @@ copy of `clean/`, and never committed anywhere.
   Script Format" section for the `.test` file grammar.
 - **`run_sql_tests.py`** - runs `.test` files against a `tinytable/`
   install: `python3 run_sql_tests.py --root clean clean/sql-tests/official`.
+- **`scheduler.py`** - the statement-level, single-threaded deterministic
+  scheduler (issue #19) that drives a `.test` file's `session`/`step`/
+  `permutation` records; `run_sql_tests.py` is one caller of it, but it's
+  a standalone module a future isolation-test suite (#10) can import and
+  drive directly, with no `.test` file involved.
 - **`mutate.py`** - the mutation operator library: a fixed set of
   single-hunk, SPEC-violating edits to `clean/tinytable`, each targeting
   one specific behavioral guarantee from SPEC.md, plus `select_operator(seed)`
@@ -67,6 +72,7 @@ DIR/
   task-prompt.md
   findings.schema.json
   run_sql_tests.py
+  scheduler.py
 ```
 
 It prints a `SEED_ROOT_JSON: {...}` line to stdout naming the seed and the

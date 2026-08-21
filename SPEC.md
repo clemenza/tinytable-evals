@@ -648,11 +648,16 @@ permutation s1a s2a
 permutation s2a s1a
 ```
 
-This issue (#18) lands the grammar and a trivial single-threaded executor
-(steps run strictly in the order a `permutation` lists them, one at a time,
-against a shared `Database`). It is deliberately not a concurrency
-simulator: real multi-session visibility rules need #10's MVCC and #19's
-dedicated scheduler, which will drive this same grammar once they land.
+#18 lands the grammar; #19 (`scheduler.py`) lands the executor - steps run
+strictly in the order a `permutation` lists them, one at a time, against a
+shared `Database`. `scheduler.py` is deliberately standalone (no `.test`
+file needed - `run_schedule(Schedule(...))` is a plain Python call) so
+#10's isolation tests, and any future tooling built on top of it, can
+drive it directly. It is deliberately not a concurrency simulator, though:
+real multi-session *visibility* rules need #10's MVCC, and automatically
+exploring every interleaving of a step set (rather than running the exact
+`permutation`s a script lists) is #23's isolationtester-style framework,
+layered on top of `scheduler.py` rather than duplicated into it.
 
 ### v2: lifecycle - `crash` / `restart` / `checkpoint`
 
@@ -737,7 +742,7 @@ assert stats retry_count converges
 |---|---|---|
 | `version` | v2 | validated, no runtime effect |
 | `statement`, `query` | v1 | full |
-| `session` / `step` / `permutation` | v2 | trivial single-threaded interleaving (real scheduler: #19) |
+| `session` / `step` / `permutation` | v2 | full, via `scheduler.py` (#19); MVCC-aware visibility needs #10 |
 | `crash` / `restart` / `checkpoint` | v2 | skipped (needs #11 WAL, #20 substrate) |
 | `repeat N { ... }` | v2 | full |
 | `advance_clock` | v2 | skipped (needs #20 virtual clock) |

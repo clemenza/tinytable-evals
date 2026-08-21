@@ -32,6 +32,8 @@ import sys
 from dataclasses import dataclass
 from typing import Optional, Union
 
+import scheduler
+
 
 SUPPORTED_GRAMMAR_VERSIONS = ("1", "2")
 _LIFECYCLE_KINDS = ("crash", "restart", "checkpoint")
@@ -398,6 +400,11 @@ def _execute_query(record: QueryRecord, db, failures: list[tuple[int, str]]) -> 
 
 
 def _execute_permutation(record: PermutationRecord, db, state: _ExecState, failures: list[tuple[int, str]]) -> None:
+    missing = [name for name in record.steps if name not in state.step_lookup]
+    if missing:
+        failures.append((record.line, f"permutation references unknown step(s): {missing}"))
+        return
+
     try:
         if state.permutation_baseline_taken:
             db.execute(f"ROLLBACK TO {_PERMUTATION_BASELINE}")
@@ -408,13 +415,30 @@ def _execute_permutation(record: PermutationRecord, db, state: _ExecState, failu
         failures.append((record.line, f"permutation {record.steps}: could not reset to baseline: {type(exc).__name__}: {exc}"))
         return
 
-    missing = [name for name in record.steps if name not in state.step_lookup]
-    if missing:
-        failures.append((record.line, f"permutation references unknown step(s): {missing}"))
-        return
-    for name in record.steps:
-        step = state.step_lookup[name]
-        _execute_statement_like(step.kind, step.error_pattern, step.sql, step.line, db, failures, label=f"step {step.name!r}: ")
+    # Delegate the actual interleaving to scheduler.py (#19) - this file's
+    # only job here is translating StepRecord/PermutationRecord (parsed
+    # from a .test file) into scheduler.Step/Schedule, running it against
+    # the shared `db`, and reporting any ok/error contract violation the
+    # same way a plain `statement` record's would be.
+    schedule = scheduler.Schedule(
+        steps=tuple(
+            scheduler.Step(session=s.session, name=s.name, sql=s.sql, kind=s.kind, error_pattern=s.error_pattern)
+            for s in state.step_lookup.values()
+        ),
+        order=tuple(record.steps),
+    )
+    result = scheduler.run_schedule(schedule, db=db)
+    for outcome in result.contract_violations:
+        step = state.step_lookup[outcome.step]
+        label = f"step {step.name!r}: "
+        if step.kind == "ok":
+            failures.append((step.line, f"{label}expected to succeed but raised {outcome.raised}: {outcome.message}\n    sql: {step.sql}"))
+        elif outcome.raised is None:
+            failures.append((step.line, f"{label}expected to raise but succeeded\n    sql: {step.sql}"))
+        else:
+            failures.append(
+                (step.line, f"{label}raised {outcome.raised}({outcome.message!r}) but that does not contain expected text {step.error_pattern!r}\n    sql: {step.sql}")
+            )
 
 
 def _execute_explain(record: ExplainRecord, db, failures: list[tuple[int, str]], skips: list[tuple[int, str]]) -> None:

@@ -21,6 +21,9 @@ two CLIs (build_seed_root.py, grade.py). Verifies:
   (f) oracle.py (issue #3's differential oracle) agrees with sqlite3 on
       every query in clean/sql-tests/official/, i.e. clean/tinytable's
       results aren't just self-consistent, they match real SQL semantics.
+  (g) scheduler.py (issue #19) is usable with no .test file involved at
+      all, is deterministic across repeated runs of the same permutation,
+      and permutation order actually changes the observed outcome.
 
 Deliberately does NOT check that any specific test can detect any specific
 operator's defect - doing so would mean writing a golden/answer test into
@@ -45,6 +48,7 @@ import sys
 import tempfile
 
 import mutate
+import scheduler
 
 HERE = pathlib.Path(__file__).resolve().parent
 CLEAN = HERE / "clean"
@@ -93,6 +97,52 @@ def check_oracle_agrees_with_clean() -> None:
         ok("oracle.py: clean/tinytable agrees with sqlite3 on clean/sql-tests/official/")
     else:
         fail(f"oracle.py: clean/tinytable disagrees with sqlite3:\n{proc.stdout}{proc.stderr}")
+
+
+def check_scheduler_is_deterministic_and_usable_standalone() -> None:
+    """#19's acceptance criteria, checked directly rather than just
+    asserted: (1) scheduler.py is usable with no .test file and no
+    run_sql_tests.py involved at all - build a Schedule in plain Python
+    and drive it; (2) the same permutation always produces the same
+    history; (3) permutation order actually changes the observed
+    outcome (otherwise "deterministic" would be trivially true of a
+    broken scheduler that ignores order entirely)."""
+    sys.path.insert(0, str(CLEAN))
+    import tinytable as clean_tinytable  # local import: must happen after sys.path is set up
+
+    steps = (
+        scheduler.Step(session="setup", name="create", sql="CREATE TABLE t (x INTEGER)"),
+        scheduler.Step(session="setup", name="seed", sql="INSERT INTO t VALUES (1)"),
+        scheduler.Step(session="s1", name="s1a", sql="UPDATE t SET x = 2 WHERE x = 1"),
+        scheduler.Step(session="s2", name="s2a", sql="UPDATE t SET x = 3 WHERE x = 1"),
+        scheduler.Step(session="check", name="read", sql="SELECT x FROM t"),
+    )
+    forward = scheduler.Schedule(steps=steps, order=("create", "seed", "s1a", "s2a", "read"))
+    reverse = scheduler.Schedule(steps=steps, order=("create", "seed", "s2a", "s1a", "read"))
+
+    if scheduler.check_deterministic(forward, clean_tinytable, trials=5):
+        ok("scheduler.py: forward permutation is deterministic across repeated trials")
+    else:
+        fail("scheduler.py: forward permutation is not deterministic across repeated trials")
+
+    if scheduler.check_deterministic(reverse, clean_tinytable, trials=5):
+        ok("scheduler.py: reverse permutation is deterministic across repeated trials")
+    else:
+        fail("scheduler.py: reverse permutation is not deterministic across repeated trials")
+
+    forward_result = scheduler.run_schedule(forward, tinytable=clean_tinytable)
+    reverse_result = scheduler.run_schedule(reverse, tinytable=clean_tinytable)
+
+    if forward_result.contract_violations or reverse_result.contract_violations:
+        fail(f"scheduler.py: unexpected contract violation(s): {forward_result.contract_violations + reverse_result.contract_violations}")
+    else:
+        ok("scheduler.py: every step matched its own ok/error contract in both permutations")
+
+    forward_read, reverse_read = forward_result.outcomes[-1], reverse_result.outcomes[-1]
+    if forward_read.rows == ((2,),) and reverse_read.rows == ((3,),):
+        ok("scheduler.py: permutation order changes the observed read, as expected (whichever UPDATE step runs first claims the row)")
+    else:
+        fail(f"scheduler.py: expected forward read ((2,),) and reverse read ((3,),), got {forward_read.rows!r} and {reverse_read.rows!r}")
 
 
 def check_operators(tmp: pathlib.Path) -> None:
@@ -214,6 +264,7 @@ def main() -> int:
 
     check_official_suite_passes_on_clean()
     check_oracle_agrees_with_clean()
+    check_scheduler_is_deterministic_and_usable_standalone()
     check_selection_is_deterministic_and_covers_all_operators()
     with tempfile.TemporaryDirectory(prefix="tinytable-evals-selfcheck-") as td:
         tmp = pathlib.Path(td)
