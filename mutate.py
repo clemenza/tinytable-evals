@@ -338,6 +338,64 @@ OPERATORS: tuple[Operator, ...] = (
         ),
     ),
     Operator(
+        id="not-null-check-skipped-on-update",
+        file="sql.py",
+        spec_section="Constraints: NOT NULL, CHECK, FOREIGN KEY",
+        find=(
+            "                    self._check_not_null(stmt.table, new_row)\n"
+            "                    self._check_check_constraints(stmt.table, new_row)\n"
+        ),
+        replace=(
+            "                    self._check_check_constraints(stmt.table, new_row)\n"
+        ),
+    ),
+    Operator(
+        id="check-null-and-false-treated-as-unknown",
+        file="sql.py",
+        spec_section="Constraints: NOT NULL, CHECK, FOREIGN KEY",
+        find=(
+            "        if node.op == \"and\":\n"
+            "            if any(r is False for r in results):\n"
+            "                return False\n"
+            "            return None if any(r is None for r in results) else True\n"
+        ),
+        replace=(
+            "        if node.op == \"and\":\n"
+            "            if any(r is None for r in results):\n"
+            "                return None\n"
+            "            return False if any(r is False for r in results) else True\n"
+        ),
+    ),
+    Operator(
+        id="fk-insert-check-skipped",
+        file="sql.py",
+        spec_section="Constraints: NOT NULL, CHECK, FOREIGN KEY",
+        find=(
+            "            self._check_foreign_keys_out(stmt.table, row)\n"
+            "            table.insert(row)\n"
+        ),
+        replace=(
+            "            table.insert(row)\n"
+        ),
+    ),
+    Operator(
+        id="fk-delete-check-skipped",
+        file="sql.py",
+        spec_section="Constraints: NOT NULL, CHECK, FOREIGN KEY",
+        find=(
+            "            incoming = self._incoming_foreign_keys(stmt.table)\n"
+            "            if incoming:\n"
+            "                ref_columns = {fk.ref_column for _, fk in incoming}\n"
+            "                for row in table.where(predicate).all():\n"
+            "                    for column in ref_columns:\n"
+            "                        self._check_no_incoming_references(stmt.table, column, row.get(column))\n"
+            "            table.delete(predicate)\n"
+        ),
+        replace=(
+            "            table.delete(predicate)\n"
+        ),
+    ),
+    Operator(
         id="expr-integer-division-floors-instead-of-truncates",
         file="sql.py",
         spec_section="Expressions in SELECT",

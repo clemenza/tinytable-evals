@@ -1,0 +1,92 @@
+# name: NOT NULL rejects an explicit NULL and an omitted column on INSERT
+statement ok
+CREATE TABLE t (email TEXT NOT NULL, n INTEGER)
+
+statement error declared NOT NULL
+INSERT INTO t VALUES (NULL, 1)
+
+statement error declared NOT NULL
+INSERT INTO t (n) VALUES (1)
+
+statement ok
+INSERT INTO t VALUES ('a@x.com', 1)
+
+# name: NOT NULL on UPDATE
+# Setting a NOT NULL column to NULL via UPDATE is deliberately not pinned
+# down here - that's the seeded defect below (see golden/ once it exists),
+# same convention as unique.test's own NULL note. UPDATE leaving a NOT
+# NULL column with its own (already non-NULL) value is still exercised.
+statement ok
+UPDATE t SET n = 2 WHERE email = 'a@x.com'
+
+query I nosort
+SELECT n FROM t WHERE email = 'a@x.com'
+----
+2
+
+# name: CHECK - three-valued, not two-valued
+statement ok
+CREATE TABLE u (a INTEGER, b INTEGER, CHECK (a > 10 AND b > 10))
+
+# unknown (a NULL) is accepted, not rejected.
+statement ok
+INSERT INTO u VALUES (NULL, 20)
+
+# definitely false (both operands concrete, no NULL involved) is rejected.
+statement error CHECK constraint failed
+INSERT INTO u VALUES (20, 1)
+
+# `NULL AND FALSE` is `FALSE` (FALSE dominates an unknown operand) - not
+# pinned down here (seeded defect below, see golden/ once it exists);
+# SPEC.md's "Constraints" section documents and manually verifies it.
+
+query I nosort
+SELECT COUNT(*) FROM u
+----
+1
+
+# name: FOREIGN KEY requires a UNIQUE INDEX on the referenced column
+statement ok
+CREATE TABLE customers (id INTEGER)
+
+statement error requires a UNIQUE INDEX
+CREATE TABLE bad_orders (id INTEGER, customer_id INTEGER, FOREIGN KEY (customer_id) REFERENCES customers(id))
+
+statement ok
+CREATE UNIQUE INDEX uq_cust ON customers(id)
+
+statement ok
+CREATE TABLE orders (id INTEGER, customer_id INTEGER, FOREIGN KEY (customer_id) REFERENCES customers(id))
+
+# name: FOREIGN KEY - referencing side accepts a matching or NULL value
+statement ok
+INSERT INTO customers VALUES (1)
+
+statement ok
+INSERT INTO customers VALUES (2)
+
+statement ok
+INSERT INTO orders VALUES (100, 1)
+
+statement ok
+INSERT INTO orders VALUES (101, NULL)
+
+query I rowsort
+SELECT customer_id FROM orders
+----
+1
+NULL
+
+# A referencing value with no match on INSERT/UPDATE, and removing/
+# changing a referenced value that's still in use, are each deliberately
+# not pinned down here (seeded defects below, see golden/ once it exists).
+# SPEC.md's "Constraints" section documents and manually verifies both.
+# DELETE/UPDATE on a referenced row that is NOT currently referenced still
+# works normally:
+statement ok
+DELETE FROM customers WHERE id = 2
+
+query I nosort
+SELECT COUNT(*) FROM customers
+----
+1
