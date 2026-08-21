@@ -292,6 +292,33 @@ An index only accelerates `=`/`<`/`<=`/`>`/`>=`/`BETWEEN` against that
 column (used alone or as one clause of an `AND`-combined `WHERE`); every
 other predicate shape still works correctly, just without the index's help.
 
+### Composite secondary index: `CREATE INDEX idx ON t(c1, c2, ...)`
+
+Two or more columns builds one index keyed by the *tuple* of their values,
+not one index per column. The same invariant as the single-column case
+holds, generalized: **a query against a composite-indexed table must
+return exactly the same rows a fully unindexed table would, regardless of
+whether or how the composite index accelerates it.**
+
+A composite index only ever accelerates an **exact-match** lookup: every
+one of its columns must appear as its own `=` comparison, `AND`-combined
+with the others (in any order - `WHERE b = 2 AND a = 1` uses a composite
+index on `(a, b)` exactly as well as `WHERE a = 1 AND b = 2` does). Any
+other shape against a composite-indexed column - a range comparison
+(`<`/`<=`/`>`/`>=`/`BETWEEN`) on one of its columns, or a `WHERE` that
+doesn't pin down every one of its columns with `=` - still returns
+correct results, just without that composite index's help (a matching
+single-column index on one of the same columns, if one also exists, may
+still accelerate it on its own).
+
+```sql
+CREATE TABLE t (a INTEGER, b INTEGER)
+INSERT INTO t VALUES (1, 2)
+CREATE INDEX idx ON t(a, b)
+SELECT b FROM t WHERE a = 1 AND b = 2    -- 2: exact-match, composite index used
+SELECT b FROM t WHERE a = 1 AND b > 0    -- 2: still correct - the `b > 0` part isn't exact-match
+```
+
 ## Uniqueness: `CREATE UNIQUE INDEX idx ON t(col)`
 
 Declares that `col` may hold at most one row with any given non-`NULL`
@@ -335,11 +362,30 @@ A single `UPDATE` cannot swap two rows' unique values in one statement
 (giving row A row B's old value and vice versa) - this is explicitly
 undefined/unsupported, not a scored behavior.
 
+### Composite uniqueness: `CREATE UNIQUE INDEX idx ON t(c1, c2, ...)`
+
+Declares that the *tuple* `(c1, c2, ...)` may hold at most one row with
+any given fully-non-`NULL` combination - two rows with `(1, 2)` and
+`(1, 2)` conflict, but `(1, 2)` and `(1, 3)` don't.
+
+**One `NULL` component is enough to exempt the whole row**, the same as a
+single-column unique constraint exempts a `NULL` value - not just a
+tuple that's `NULL` in every component:
+
+```sql
+CREATE TABLE t (a INTEGER, b INTEGER)
+CREATE UNIQUE INDEX uq ON t(a, b)
+INSERT INTO t VALUES (1, NULL)
+INSERT INTO t VALUES (1, NULL)   -- NOT a conflict: b is NULL in both
+INSERT INTO t VALUES (1, 2)
+INSERT INTO t VALUES (1, 2)      -- raises: already present
+```
+
 ## `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` / `COMMIT`
 
 `SAVEPOINT name` snapshots **every table's entire state** - rows, every
-secondary index's contents, and every unique constraint's contents - under
-`name`.
+secondary index's contents (single-column and composite), and every unique
+constraint's contents (single-column and composite) - under `name`.
 
 `ROLLBACK TO name` restores that exact snapshot on every table that has it:
 rows, index contents, and unique-constraint contents all revert together.

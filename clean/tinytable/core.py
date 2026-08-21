@@ -294,6 +294,19 @@ class _UniqueIndex:
 # ---------------------------------------------------------------------------
 
 
+def _composite_key(row: dict, columns: tuple) -> Optional[tuple]:
+    """The value a composite index/unique constraint on `columns` stores
+    for `row`: the tuple of each column's value, or None (never indexed,
+    never participates in uniqueness - reusing _Index/_UniqueIndex's
+    existing "None is exempt" handling unchanged) if *any* component is
+    None. This generalizes SPEC.md's single-column NULL rule the same way
+    sqlite3's own composite UNIQUE indexes do: one NULL component is enough
+    to exempt the whole row, not just an all-NULL tuple.
+    """
+    values = tuple(row.get(c) for c in columns)
+    return None if None in values else values
+
+
 class Table:
     def __init__(self, name: str = "table"):
         self.name = name
@@ -301,6 +314,14 @@ class Table:
         self._next_id = 0
         self._indexes: dict[str, _Index] = {}
         self._unique: dict[str, _UniqueIndex] = {}
+        # Composite (multi-column) counterparts, keyed by the column tuple
+        # (see create_index()/unique() and _composite_key() above) - kept
+        # separate from the single-column dicts above rather than folding
+        # single-column indexes into 1-tuple keys, so every existing
+        # single-column code path (and the operators anchored to it) is
+        # untouched by composite-index support.
+        self._composite_indexes: dict[tuple, _Index] = {}
+        self._composite_unique: dict[tuple, _UniqueIndex] = {}
         # Insertion-ordered: dict preserves key order in Python >= 3.7.
         self._savepoints: dict[str, dict] = {}
 
@@ -311,13 +332,19 @@ class Table:
         row = dict(row)
         for col, uidx in self._unique.items():
             uidx.check(row.get(col))
+        for cols, uidx in self._composite_unique.items():
+            uidx.check(_composite_key(row, cols))
         row_id = self._next_id
         self._next_id += 1
         self._rows[row_id] = row
         for col, uidx in self._unique.items():
             uidx.add(row.get(col), row_id)
+        for cols, uidx in self._composite_unique.items():
+            uidx.add(_composite_key(row, cols), row_id)
         for col, idx in self._indexes.items():
             idx.add(row_id, row.get(col))
+        for cols, idx in self._composite_indexes.items():
+            idx.add(row_id, _composite_key(row, cols))
         return row_id
 
     def update(self, predicate: Predicate, changes: dict) -> int:
@@ -329,6 +356,9 @@ class Table:
         """
         row_ids = sorted(self._resolve_row_ids(predicate))
         touched_cols = list(changes.keys())
+        touched = set(touched_cols)
+        touched_composite_unique = [cols for cols in self._composite_unique if touched & set(cols)]
+        touched_composite_indexes = [cols for cols in self._composite_indexes if touched & set(cols)]
         for row_id in row_ids:
             row = self._rows[row_id]
             new_row = dict(row)
@@ -336,17 +366,27 @@ class Table:
             for col in touched_cols:
                 if col in self._unique:
                     self._unique[col].check(new_row.get(col), row_id=row_id)
+            for cols in touched_composite_unique:
+                self._composite_unique[cols].check(_composite_key(new_row, cols), row_id=row_id)
             for col in touched_cols:
                 if col in self._unique:
                     self._unique[col].remove(row.get(col), row_id)
                 if col in self._indexes:
                     self._indexes[col].remove(row_id, row.get(col))
+            for cols in touched_composite_unique:
+                self._composite_unique[cols].remove(_composite_key(row, cols), row_id)
+            for cols in touched_composite_indexes:
+                self._composite_indexes[cols].remove(row_id, _composite_key(row, cols))
             self._rows[row_id] = new_row
             for col in touched_cols:
                 if col in self._unique:
                     self._unique[col].add(new_row.get(col), row_id)
                 if col in self._indexes:
                     self._indexes[col].add(row_id, new_row.get(col))
+            for cols in touched_composite_unique:
+                self._composite_unique[cols].add(_composite_key(new_row, cols), row_id)
+            for cols in touched_composite_indexes:
+                self._composite_indexes[cols].add(row_id, _composite_key(new_row, cols))
         return len(row_ids)
 
     def delete(self, predicate: Predicate) -> int:
@@ -356,30 +396,57 @@ class Table:
             row = self._rows.pop(row_id)
             for col, uidx in self._unique.items():
                 uidx.remove(row.get(col), row_id)
+            for cols, uidx in self._composite_unique.items():
+                uidx.remove(_composite_key(row, cols), row_id)
             for col, idx in self._indexes.items():
                 idx.remove(row_id, row.get(col))
+            for cols, idx in self._composite_indexes.items():
+                idx.remove(row_id, _composite_key(row, cols))
         return len(row_ids)
 
     # -- schema --------------------------------------------------------
 
-    def create_index(self, column: str) -> None:
-        """Build (or rebuild) a secondary index on `column` from current rows."""
-        idx = _Index(column)
-        for row_id, row in self._rows.items():
-            idx.add(row_id, row.get(column))
-        self._indexes[column] = idx
-
-    def unique(self, column: str) -> None:
-        """Register a unique constraint on `column`, validated against
-        current rows (NULL is exempt). Raises UniqueViolation if the
-        existing data already has a duplicate non-NULL value.
+    def create_index(self, columns) -> None:
+        """Build (or rebuild) a secondary index from current rows. `columns`
+        is a single column name, or a sequence of >= 2 for a composite
+        index keyed by the tuple of their values (see SPEC.md's "Composite
+        secondary index").
         """
-        uidx = _UniqueIndex(column)
+        if isinstance(columns, str):
+            idx = _Index(columns)
+            for row_id, row in self._rows.items():
+                idx.add(row_id, row.get(columns))
+            self._indexes[columns] = idx
+            return
+        key = tuple(columns)
+        idx = _Index(",".join(key))
         for row_id, row in self._rows.items():
-            value = row.get(column)
+            idx.add(row_id, _composite_key(row, key))
+        self._composite_indexes[key] = idx
+
+    def unique(self, columns) -> None:
+        """Register a unique constraint, validated against current rows
+        (NULL - or, for a composite `columns` sequence, any one component
+        being NULL - is exempt). Raises UniqueViolation if the existing
+        data already has a duplicate non-exempt value/tuple. `columns` is a
+        single column name, or a sequence of >= 2 for a composite
+        constraint on the tuple of their values.
+        """
+        if isinstance(columns, str):
+            uidx = _UniqueIndex(columns)
+            for row_id, row in self._rows.items():
+                value = row.get(columns)
+                uidx.check(value, row_id=row_id)
+                uidx.add(value, row_id)
+            self._unique[columns] = uidx
+            return
+        key = tuple(columns)
+        uidx = _UniqueIndex(",".join(key))
+        for row_id, row in self._rows.items():
+            value = _composite_key(row, key)
             uidx.check(value, row_id=row_id)
             uidx.add(value, row_id)
-        self._unique[column] = uidx
+        self._composite_unique[key] = uidx
 
     # -- querying ------------------------------------------------------
 
@@ -439,6 +506,8 @@ class Table:
             "next_id": self._next_id,
             "indexes": copy.deepcopy(self._indexes),
             "unique": copy.deepcopy(self._unique),
+            "composite_indexes": copy.deepcopy(self._composite_indexes),
+            "composite_unique": copy.deepcopy(self._composite_unique),
         }
 
     def _restore(self, snapshot: dict) -> None:
@@ -446,6 +515,8 @@ class Table:
         self._next_id = snapshot["next_id"]
         self._indexes = copy.deepcopy(snapshot["indexes"])
         self._unique = copy.deepcopy(snapshot["unique"])
+        self._composite_indexes = copy.deepcopy(snapshot["composite_indexes"])
+        self._composite_unique = copy.deepcopy(snapshot["composite_unique"])
 
     # -- internals -------------------------------------------------------
 
@@ -470,6 +541,9 @@ class Table:
             ids = self._index_candidates_for_part(part)
             if ids is not None:
                 narrowed = ids if narrowed is None else (narrowed & ids)
+        composite_ids = self._composite_index_candidates(parts)
+        if composite_ids is not None:
+            narrowed = composite_ids if narrowed is None else (narrowed & composite_ids)
         return narrowed
 
     def _index_candidates_for_part(self, part: Predicate) -> Optional[set]:
@@ -488,6 +562,27 @@ class Table:
         ):
             return self._indexes[part.column].scan_between(part.lo, part.hi)
         return None
+
+    def _composite_index_candidates(self, parts: list) -> Optional[set]:
+        """A composite index only ever accelerates an *exact-match* lookup:
+        every one of its columns must appear as its own `=` AND-part with a
+        non-NULL value (see SPEC.md's "Composite secondary index" - a range
+        comparison on a composite column, or a predicate that doesn't cover
+        every one of the index's columns, falls back to a full scan, same
+        as an unindexed query would: still correct, just unaccelerated).
+        """
+        eq_by_column = {
+            part.column: part.value
+            for part in parts
+            if isinstance(part, Comparison) and part.op == "eq" and part.value is not None
+        }
+        narrowed: Optional[set] = None
+        for columns, idx in self._composite_indexes.items():
+            if all(c in eq_by_column for c in columns):
+                key = tuple(eq_by_column[c] for c in columns)
+                ids = idx.scan("eq", key)
+                narrowed = ids if narrowed is None else (narrowed & ids)
+        return narrowed
 
 
 # ---------------------------------------------------------------------------
