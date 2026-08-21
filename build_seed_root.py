@@ -16,6 +16,7 @@ repo's mutation operator library and applies it to a fresh copy of
       task-prompt.md
       findings.schema.json
       run_sql_tests.py
+      scheduler.py             run_sql_tests.py's permutation executor (#19)
 
 `DIR` is git-initialized and committed as the pristine baseline, matching
 what `grade.py` expects (it uses `git status` to confirm the agent left
@@ -68,6 +69,7 @@ def build_seed_root(seed: int, out: pathlib.Path) -> mutate.Operator:
     (agent_dir / ".gitkeep").write_text("")
 
     shutil.copy2(HERE / "run_sql_tests.py", out / "run_sql_tests.py")
+    shutil.copy2(HERE / "scheduler.py", out / "scheduler.py")  # run_sql_tests.py's own permutation executor (#19) imports this
     shutil.copy2(HERE / "SPEC.md", out / "SPEC.md")
     shutil.copy2(HERE / "task-prompt.md", out / "task-prompt.md")
     shutil.copy2(HERE / "findings.schema.json", out / "findings.schema.json")
