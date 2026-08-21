@@ -1,0 +1,21 @@
+version 2
+
+# explain / assert stats - SPEC.md's "v2: EXPLAIN and assert stats"
+# section. Neither has a `tinytable` feature to run against yet (no query
+# planner until #12, no stats interface until #21/#22), so
+# run_sql_tests.py reports both as skipped rather than executing them.
+
+statement ok
+CREATE TABLE t (x INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+explain
+SELECT x FROM t WHERE x = 1
+----
+index scan idx
+
+assert stats index_lookup_count bounded <= 100
+
+assert stats retry_count converges

@@ -535,7 +535,28 @@ statements within one file share state top to bottom.
 A file is a sequence of **records**, separated by blank lines. `#`-prefixed
 lines are comments (a `# name: ...` line immediately before a record is a
 convention for a human-readable label - the runner ignores it as a comment
-like any other). Two record kinds:
+like any other).
+
+### Grammar version
+
+The `.test` grammar itself carries a version number. An optional `version N`
+line, if present, must be the very **first** line of the file (before any
+other record, comments/blank lines aside) and declares which grammar the
+file was written against:
+
+```
+version 2
+```
+
+A file with no `version` line is implicitly version 1 (every record kind
+below except `version` itself existed in v1) - this is what keeps every
+`.test` file written before this section's v2 additions parsing unchanged.
+`run_sql_tests.py` rejects an unrecognized version number outright rather
+than guessing. Bumping this number is the mechanism for any future grammar
+change, so extensions land here once, versioned, instead of being
+special-cased per milestone.
+
+### v1: statements and queries
 
 **`statement ok` / `statement error [substring]`** - every following
 non-blank line up to the next blank line is the SQL text (may span multiple
@@ -589,3 +610,140 @@ This is a deliberately small **subset** of the real sqllogictest format
 multi-connection labels) purpose-built for tinytable's single dialect -
 `run_sql_tests.py` is not a drop-in replacement for the reference
 sqllogictest tooling.
+
+### v2: session / step / permutation
+
+Modeled on PostgreSQL's `isolationtester` spec format. `session <name>`
+declares (or re-selects) a named session; every `step <name> [error
+[substring]]` record that follows belongs to the most recently declared
+session, until the next `session` line. A step's body is SQL text, read the
+same way as `statement`'s; `step <name>` alone expects it to succeed,
+`step <name> error [substring]` mirrors `statement error`'s contract.
+
+A step is only a *declaration* - it does not run where it's written.
+`permutation <step1> <step2> ...` is what actually executes: it runs the
+named steps, in exactly the order listed, as one deterministic,
+single-threaded interleaving. A file may declare more than one
+`permutation` record to exercise several interleavings of the same steps;
+each one runs from the same baseline (whatever `statement`s ran before the
+first `session` line set up), independent of what an earlier permutation in
+the same file mutated.
+
+```
+statement ok
+CREATE TABLE t (x INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+session s1
+step s1a
+UPDATE t SET x = 2 WHERE x = 1
+
+session s2
+step s2a
+UPDATE t SET x = 3 WHERE x = 1
+
+permutation s1a s2a
+permutation s2a s1a
+```
+
+This issue (#18) lands the grammar and a trivial single-threaded executor
+(steps run strictly in the order a `permutation` lists them, one at a time,
+against a shared `Database`). It is deliberately not a concurrency
+simulator: real multi-session visibility rules need #10's MVCC and #19's
+dedicated scheduler, which will drive this same grammar once they land.
+
+### v2: lifecycle - `crash` / `restart` / `checkpoint`
+
+Bare, argument-less directives marking points in a script where the engine
+should crash, restart, or checkpoint. `tinytable` has no persistence layer
+yet (that's milestone 5, #11, together with #20's deterministic simulation
+substrate), so today these are recognized by the grammar and reported as
+**skipped** (not failed, not silently ignored) rather than pretending to
+exercise crash recovery that doesn't exist yet:
+
+```
+step s1a
+INSERT INTO t VALUES (1)
+
+checkpoint
+
+crash
+
+restart
+```
+
+### v2: long-soak - `repeat N { ... }`, `advance_clock`, `threshold`
+
+`repeat N { ... }` wraps a nested block of records (any record kind,
+including a nested `repeat`) and runs it `N` times in sequence against the
+same shared `Database` - useful for driving many iterations of an
+operation to look for state that leaks or drifts, without hand-duplicating
+the block:
+
+```
+repeat 50 {
+statement ok
+INSERT INTO t VALUES (1)
+
+statement ok
+DELETE FROM t WHERE x = 1
+}
+```
+
+`advance_clock <duration>` (e.g. `advance_clock 10s`) and
+`threshold <stat> <op> <bound>` (e.g. `threshold retry_count <= 3`) are
+single-line, argument-carrying directives for scripts that need a virtual
+clock or a soak-test bound. Like the lifecycle directives above, both are
+grammar-only today - they parse and are reported as skipped pending #20's
+virtual clock and #21's Grader v2 stats plumbing, which will give them
+runtime effect without any further grammar change.
+
+### v2: `EXPLAIN` and `assert stats`
+
+**`explain`** is shaped like `query` but with no `<types>`/`[sort mode]`
+token - a plan has no row/column count to declare. Lines up to `----` are
+the SQL text; lines after are the expected plan, one line per step, exact
+order:
+
+```
+explain
+SELECT x FROM t WHERE x = 1
+----
+index scan idx
+```
+
+**`assert stats <stat> converges`** / **`assert stats <stat> bounded <op>
+<bound>`** check the engine's internal counters. Deliberately not
+exact-value assertions - `converges` means "stops changing under repeated
+identical operations" and `bounded` means "stays within a limit", which is
+what a long-soak run can actually promise about, say, an index's entry
+count or a retry counter (an exact value would overfit to one run's timing
+or scheduling). Both forms are recorded records from day one, but need a
+query planner (`EXPLAIN`, milestone 6/#12) or a stats interface
+(`assert stats`, #21/#22) `tinytable` doesn't have yet, so `run_sql_tests.py`
+reports them as skipped until those land - at which point this grammar
+does not need to change, only the runner's execution of it.
+
+```
+assert stats index_lookup_count bounded <= 100
+assert stats retry_count converges
+```
+
+### Execution status summary
+
+| directive | parses | executes today |
+|---|---|---|
+| `version` | v2 | validated, no runtime effect |
+| `statement`, `query` | v1 | full |
+| `session` / `step` / `permutation` | v2 | trivial single-threaded interleaving (real scheduler: #19) |
+| `crash` / `restart` / `checkpoint` | v2 | skipped (needs #11 WAL, #20 substrate) |
+| `repeat N { ... }` | v2 | full |
+| `advance_clock` | v2 | skipped (needs #20 virtual clock) |
+| `threshold` | v2 | skipped (needs #21 Grader v2) |
+| `explain` | v2 | skipped (needs #12 planner) |
+| `assert stats` | v2 | skipped (needs #21/#22 stats interface) |
+
+A "skipped" record is reported distinctly from a failure and never counts
+against a run's exit code - see `run_sql_tests.py`'s own output.

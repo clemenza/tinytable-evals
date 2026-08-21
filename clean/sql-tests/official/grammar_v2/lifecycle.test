@@ -1,0 +1,23 @@
+version 2
+
+# crash / restart / checkpoint - SPEC.md's "v2: lifecycle" section. No
+# persistence layer exists yet (pending #11's WAL/crash-recovery milestone
+# and #20's deterministic simulation substrate), so run_sql_tests.py
+# reports these as skipped rather than executing or failing them.
+
+statement ok
+CREATE TABLE t (x INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+checkpoint
+
+crash
+
+restart
+
+query I nosort
+SELECT x FROM t
+----
+1
