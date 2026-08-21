@@ -299,6 +299,45 @@ OPERATORS: tuple[Operator, ...] = (
         ),
     ),
     Operator(
+        id="composite-unique-null-participates",
+        file="core.py",
+        spec_section="Composite uniqueness",
+        find=(
+            "    values = tuple(row.get(c) for c in columns)\n"
+            "    return None if None in values else values\n"
+        ),
+        replace=(
+            "    values = tuple(row.get(c) for c in columns)\n"
+            "    return values\n"
+        ),
+    ),
+    Operator(
+        id="composite-index-partial-key-treated-as-match",
+        file="core.py",
+        spec_section="Composite secondary index",
+        find=(
+            "            if all(c in eq_by_column for c in columns):\n"
+            "                key = tuple(eq_by_column[c] for c in columns)\n"
+        ),
+        replace=(
+            "            if any(c in eq_by_column for c in columns):\n"
+            "                key = tuple(eq_by_column.get(c) for c in columns)\n"
+        ),
+    ),
+    Operator(
+        id="composite-update-partial-touch-skips-index",
+        file="core.py",
+        spec_section="Composite secondary index",
+        find=(
+            "        touched_composite_unique = [cols for cols in self._composite_unique if touched & set(cols)]\n"
+            "        touched_composite_indexes = [cols for cols in self._composite_indexes if touched & set(cols)]\n"
+        ),
+        replace=(
+            "        touched_composite_unique = [cols for cols in self._composite_unique if touched >= set(cols)]\n"
+            "        touched_composite_indexes = [cols for cols in self._composite_indexes if touched >= set(cols)]\n"
+        ),
+    ),
+    Operator(
         id="expr-integer-division-floors-instead-of-truncates",
         file="sql.py",
         spec_section="Expressions in SELECT",

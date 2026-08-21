@@ -1,0 +1,120 @@
+# name: composite secondary index accelerates exact-match lookups
+statement ok
+CREATE TABLE t (a INTEGER, b INTEGER, tag TEXT)
+
+statement ok
+CREATE INDEX idx ON t(a, b)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 'p')
+
+statement ok
+INSERT INTO t VALUES (1, 2, 'q')
+
+statement ok
+INSERT INTO t VALUES (2, 1, 'r')
+
+query T nosort
+SELECT tag FROM t WHERE a = 1 AND b = 2
+----
+q
+
+# name: composite index column order in WHERE doesn't matter
+query T nosort
+SELECT tag FROM t WHERE b = 1 AND a = 2
+----
+r
+
+# A composite index must return the same rows an unindexed table would for
+# shapes it can't accelerate: a range comparison on one of its columns, or
+# a WHERE that doesn't pin every one of its columns with '=' (e.g. `a = 1`
+# alone, or `a = 1 AND b > 0`, against the `(a, b)` index above). Neither
+# scenario is pinned down here - that's the seeded defect below (see
+# golden/ once it exists), same convention as unique.test's NULL note.
+# SPEC.md's "Composite secondary index" section documents and manually
+# verifies both with worked examples.
+
+# name: a single-column index may coexist on a column a composite index
+# also covers - building it must not disturb the composite index or the
+# rows (a WHERE naming only `a`, not `b`, is exactly the composite-index
+# partial-key seeded defect above, so it's deliberately not queried here -
+# see index.test for single-column range-scan coverage instead).
+statement ok
+CREATE INDEX idx_a ON t(a)
+
+query T nosort
+SELECT tag FROM t WHERE a = 2 AND b = 1
+----
+r
+
+# name: composite unique
+# A NULL in any one component exempts a row from the composite unique
+# constraint - not pinned down here (seeded defect below, see golden/ once
+# it exists; SPEC.md's "Composite uniqueness" section documents and
+# manually verifies it), same convention as unique.test's own NULL note.
+statement ok
+CREATE TABLE u (a INTEGER, b INTEGER)
+
+statement ok
+CREATE UNIQUE INDEX uq ON u(a, b)
+
+statement ok
+INSERT INTO u VALUES (5, 5)
+
+statement error already present
+INSERT INTO u VALUES (5, 5)
+
+# a partial match on the composite key (one column equal, the other
+# different) is not a conflict.
+statement ok
+INSERT INTO u VALUES (5, 6)
+
+# name: composite unique validated immediately against existing data
+statement ok
+CREATE TABLE dup (a INTEGER, b INTEGER)
+
+statement ok
+INSERT INTO dup VALUES (1, 1)
+
+statement ok
+INSERT INTO dup VALUES (1, 1)
+
+statement error already present
+CREATE UNIQUE INDEX uq_dup ON dup(a, b)
+
+# name: rollback restores composite index/unique contents together with rows
+statement ok
+CREATE TABLE r (a INTEGER, b INTEGER)
+
+statement ok
+CREATE UNIQUE INDEX uq_r ON r(a, b)
+
+statement ok
+CREATE INDEX idx_r ON r(a, b)
+
+statement ok
+INSERT INTO r VALUES (1, 1)
+
+statement ok
+SAVEPOINT s1
+
+statement ok
+INSERT INTO r VALUES (2, 2)
+
+statement ok
+ROLLBACK TO s1
+
+query I nosort
+SELECT COUNT(*) FROM r WHERE a = 2 AND b = 2
+----
+0
+
+# the rolled-back key is free again - a stale composite index/unique entry
+# would reject this.
+statement ok
+INSERT INTO r VALUES (2, 2)
+
+query I nosort
+SELECT COUNT(*) FROM r
+----
+2

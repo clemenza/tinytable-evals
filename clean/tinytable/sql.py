@@ -101,7 +101,7 @@ class CreateTable:
 @dataclass
 class CreateIndex:
     table: str
-    column: str
+    columns: list[str]  # >= 2 means a composite index/constraint
     unique: bool
 
 
@@ -351,18 +351,14 @@ class Parser:
             index_name = self._eat_ident()
             self._eat_keyword("ON")
             table = self._eat_ident()
-            self._eat_op("(")
-            column = self._eat_ident()
-            self._eat_op(")")
-            return CreateIndex(table=table, column=column, unique=True)
+            columns = self._parse_column_list()
+            return CreateIndex(table=table, columns=columns, unique=True)
         if self._try_keyword("INDEX"):
             index_name = self._eat_ident()
             self._eat_keyword("ON")
             table = self._eat_ident()
-            self._eat_op("(")
-            column = self._eat_ident()
-            self._eat_op(")")
-            return CreateIndex(table=table, column=column, unique=False)
+            columns = self._parse_column_list()
+            return CreateIndex(table=table, columns=columns, unique=False)
         self._eat_keyword("TABLE")
         table = self._eat_ident()
         columns = self._parse_column_defs()
@@ -787,10 +783,15 @@ class Database:
             return None
         if isinstance(stmt, CreateIndex):
             table = self.table(stmt.table)
+            # A single-column CREATE INDEX still routes through core.py's
+            # scalar-column path (unlocking range scans - eq/lt/le/gt/ge/
+            # between - not just the composite path's exact-match-only
+            # acceleration; see SPEC.md's "Composite secondary index").
+            target = stmt.columns[0] if len(stmt.columns) == 1 else stmt.columns
             if stmt.unique:
-                table.unique(stmt.column)
+                table.unique(target)
             else:
-                table.create_index(stmt.column)
+                table.create_index(target)
             return None
         if isinstance(stmt, Insert):
             table = self.table(stmt.table)
