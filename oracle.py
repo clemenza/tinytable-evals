@@ -39,6 +39,15 @@ sqlite3 only if tinytable itself accepted it. That keeps both engines
 tracking the same logical state while never asking sqlite3 to agree with a
 type-strictness rule it doesn't implement.
 
+A `query` record's SQL is always expected to succeed on tinytable (that's
+`run_sql_tests.py`'s own contract too - there is no "query error" record
+kind); a `SELECT` a corpus expects to raise on tinytable (e.g. one of
+"Expressions in SELECT"'s exact-type-checking cases) must be authored as a
+`statement error <substring>` record instead, same as any other expected
+error - `db.execute()` doesn't care which record kind called it. Getting
+this wrong (using `query` for a SELECT that legitimately raises even on
+`clean`) shows up here as a false disagreement, not a missing check.
+
 `OFFSET n` with no `LIMIT` is valid tinytable grammar (SPEC.md's "`LIMIT n`
 / `OFFSET n`") but a bare syntax error in sqlite3, which requires `LIMIT`
 whenever `OFFSET` is present. `_to_sqlite_sql` rewrites it to `LIMIT -1

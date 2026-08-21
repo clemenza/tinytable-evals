@@ -1,0 +1,131 @@
+# name: arithmetic on plain columns
+statement ok
+CREATE TABLE t (a INTEGER, b INTEGER, c REAL)
+
+statement ok
+INSERT INTO t VALUES (5, 2, 2.5)
+
+query I nosort
+SELECT a + b FROM t
+----
+7
+
+query I nosort
+SELECT a - b FROM t
+----
+3
+
+query I nosort
+SELECT a * b FROM t
+----
+10
+
+query R nosort
+SELECT a * c FROM t
+----
+12.5
+
+# name: integer division truncates toward zero, like sqlite3's `/`
+query I nosort
+SELECT a / b FROM t
+----
+2
+
+# Mixed-sign integer division (where truncate-toward-zero and floor
+# division disagree, e.g. -5 / 2) and division-by-zero-is-NULL are each
+# deliberately not pinned down anywhere in this file - those are seeded
+# defects (see golden/ once it exists), same convention as unique.test's
+# "never inserts two NULLs into the same unique() column" note. SPEC.md's
+# "Expressions in SELECT" section still documents and manually verifies
+# both rules with worked examples.
+
+# name: unary minus and parenthesized grouping
+query I nosort
+SELECT -a FROM t
+----
+-5
+
+query I nosort
+SELECT (a + b) * 2 FROM t
+----
+14
+
+# name: NULL propagates through every arithmetic operator
+statement ok
+CREATE TABLE nulls (x INTEGER, y INTEGER)
+
+statement ok
+INSERT INTO nulls VALUES (NULL, 3)
+
+statement ok
+INSERT INTO nulls VALUES (7, NULL)
+
+query I rowsort
+SELECT x + y FROM nulls
+----
+NULL
+NULL
+
+query I rowsort
+SELECT x - y FROM nulls
+----
+NULL
+NULL
+
+query I rowsort
+SELECT x * y FROM nulls
+----
+NULL
+NULL
+
+query I rowsort
+SELECT x / y FROM nulls
+----
+NULL
+NULL
+
+query I rowsort
+SELECT -x FROM nulls
+----
+NULL
+-7
+
+# name: string concatenation with `||`
+statement ok
+CREATE TABLE names (first TEXT, last TEXT)
+
+statement ok
+INSERT INTO names VALUES ('Ann', 'Lee')
+
+statement ok
+INSERT INTO names VALUES ('Bo', NULL)
+
+query T rowsort
+SELECT first || ' ' || last FROM names
+----
+Ann Lee
+NULL
+
+# name: several expression items in one SELECT, mixed with plain columns
+statement ok
+CREATE TABLE prices (item TEXT, qty INTEGER, unit_price REAL)
+
+statement ok
+INSERT INTO prices VALUES ('widget', 3, 2.0)
+
+query TIR nosort
+SELECT item, qty, qty * unit_price FROM prices
+----
+widget
+3
+6.0
+
+# name: arithmetic type errors are exact, same spirit as declared-column typing
+statement error requires numeric operands
+SELECT item + 1 FROM prices
+
+statement error requires TEXT operands
+SELECT qty || 'x' FROM prices
+
+statement error requires a numeric operand
+SELECT -item FROM prices

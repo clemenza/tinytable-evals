@@ -54,8 +54,14 @@ select        := SELECT select_list FROM ident [WHERE condition]
                  [ORDER BY ident [ASC|DESC] [NULLS (FIRST|LAST)]]
                  [LIMIT number] [OFFSET number]
 select_list   := '*' | select_item (',' select_item)*
-select_item   := ident | COUNT '(' ('*' | ident) ')'
-                       | MIN '(' ident ')' | MAX '(' ident ')'
+select_item   := expr | COUNT '(' ('*' | ident) ')'
+                      | MIN '(' ident ')' | MAX '(' ident ')'
+expr          := concat
+concat        := arith ('||' arith)*
+arith         := term (('+' | '-') term)*
+term          := factor (('*' | '/') factor)*
+factor        := '-' factor | ident | NUMBER | STRING | NULL | TRUE | FALSE
+                       | '(' expr ')'
 savepoint     := SAVEPOINT ident
 rollback      := ROLLBACK TO [SAVEPOINT] ident
 release       := RELEASE [SAVEPOINT] ident
@@ -161,6 +167,59 @@ match `NULL`.
 
 A column **never written on a given row** behaves identically to that
 column holding `NULL`, for every rule above.
+
+## Expressions in `SELECT`
+
+A `select_item` (the grammar above) is not limited to a bare column name:
+it may be an arithmetic expression (`+ - * /`), a string concatenation
+(`||`), a unary minus, or a parenthesized grouping of any of those, freely
+mixed with plain columns and with each other in one `SELECT`'s item list
+(this is separate from, and does not extend, `COUNT`/`MIN`/`MAX`, which
+still take exactly one bare column or `*`). Precedence, loosest to
+tightest: `||`, then `+`/`-`, then `*`/`/`, then unary `-`.
+
+```sql
+CREATE TABLE prices (item TEXT, qty INTEGER, unit_price REAL)
+INSERT INTO prices VALUES ('widget', 3, 2.0)
+SELECT item, qty, qty * unit_price FROM prices   -- 'widget', 3, 6.0
+SELECT (qty + 1) * unit_price FROM prices        -- 8.0
+```
+
+**`NULL` propagates through every operator here**, the same rule as
+`WHERE`'s three-valued logic (see above): any `NULL` operand - column or
+sub-expression - makes the whole (sub)expression `NULL`, never an error.
+
+```sql
+CREATE TABLE t (x INTEGER, y INTEGER)
+INSERT INTO t VALUES (NULL, 3)
+SELECT x + y FROM t     -- NULL
+SELECT -x FROM t        -- NULL
+```
+
+**Division by zero is `NULL`, not an error** (matching real SQL engines'
+common behavior, e.g. sqlite3's `/`) - `5 / 0` and `5.0 / 0` both evaluate
+to `NULL`. Integer `/` integer **truncates toward zero** (not floor): `-5 /
+2` is `-2`, not `-3`. `/` between any `REAL` operand and anything else
+produces a `REAL` result via ordinary division.
+
+**Types are exact, same spirit as declared-column typing** (see "Column
+Types" above): `+`/`-`/`*`/`/`/unary `-` require both operands to be
+`INTEGER` or `REAL` (never `BOOLEAN` - `BOOLEAN` never silently
+participates in arithmetic, same reasoning as its exclusion from
+`INTEGER`), and `||` requires both operands to be `TEXT`. A type mismatch
+raises `SqlError` rather than coercing.
+
+```sql
+CREATE TABLE t2 (name TEXT, n INTEGER)
+INSERT INTO t2 VALUES ('a', 1)
+SELECT name + 1 FROM t2    -- raises: '+' requires numeric operands
+SELECT n || 'x' FROM t2    -- raises: '||' requires TEXT operands
+```
+
+Note this expression grammar applies to `SELECT`'s item list only - it
+does **not** extend `WHERE`'s `value` grammar (still `NUMBER | STRING |
+NULL | TRUE | FALSE`, no arithmetic and no negative-literal syntax) or
+`INSERT`/`UPDATE`'s values, which are unaffected.
 
 ## `ORDER BY col [ASC|DESC] [NULLS FIRST|LAST]`
 
