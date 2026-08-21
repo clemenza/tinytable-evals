@@ -18,6 +18,9 @@ two CLIs (build_seed_root.py, grade.py). Verifies:
       non-answer-revealing scenarios: an empty sql-tests/agent/ fails the
       contract, and a no-op test passes the contract but doesn't "kill"
       anything.
+  (f) oracle.py (issue #3's differential oracle) agrees with sqlite3 on
+      every query in clean/sql-tests/official/, i.e. clean/tinytable's
+      results aren't just self-consistent, they match real SQL semantics.
 
 Deliberately does NOT check that any specific test can detect any specific
 operator's defect - doing so would mean writing a golden/answer test into
@@ -49,6 +52,7 @@ OFFICIAL = CLEAN / "sql-tests" / "official"
 RUNNER = HERE / "run_sql_tests.py"
 BUILD_SEED_ROOT = HERE / "build_seed_root.py"
 GRADE = HERE / "grade.py"
+ORACLE = HERE / "oracle.py"
 
 _failures: list[str] = []
 
@@ -77,6 +81,18 @@ def check_official_suite_passes_on_clean() -> None:
         ok("official suite passes on clean")
     else:
         fail(f"official suite fails on clean:\n{output}")
+
+
+def check_oracle_agrees_with_clean() -> None:
+    proc = subprocess.run(
+        [sys.executable, "-B", str(ORACLE), "--root", str(CLEAN), str(OFFICIAL)],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        ok("oracle.py: clean/tinytable agrees with sqlite3 on clean/sql-tests/official/")
+    else:
+        fail(f"oracle.py: clean/tinytable disagrees with sqlite3:\n{proc.stdout}{proc.stderr}")
 
 
 def check_operators(tmp: pathlib.Path) -> None:
@@ -197,6 +213,7 @@ def main() -> int:
         return 1
 
     check_official_suite_passes_on_clean()
+    check_oracle_agrees_with_clean()
     check_selection_is_deterministic_and_covers_all_operators()
     with tempfile.TemporaryDirectory(prefix="tinytable-evals-selfcheck-") as td:
         tmp = pathlib.Path(td)
