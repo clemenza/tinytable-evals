@@ -1,9 +1,11 @@
 version 2
 
 # repeat / advance_clock / threshold - SPEC.md's "v2: long-soak" section.
-# `repeat` actually runs its body N times today; `advance_clock` and
-# `threshold` are grammar-only pending #20's virtual clock and #21's
-# Grader v2 stats plumbing, so run_sql_tests.py reports them as skipped.
+# `repeat` actually runs its body N times; as of #20, `advance_clock` also
+# genuinely executes (against the file's own seeded substrate.Simulation
+# clock) though nothing reads it yet (no TTL/retention feature exists).
+# `threshold` is still grammar-only, pending #21's Grader v2 stats
+# plumbing, so run_sql_tests.py reports it as skipped.
 
 statement ok
 CREATE TABLE t (x INTEGER)

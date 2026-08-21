@@ -24,6 +24,10 @@ two CLIs (build_seed_root.py, grade.py). Verifies:
   (g) scheduler.py (issue #19) is usable with no .test file involved at
       all, is deterministic across repeated runs of the same permutation,
       and permutation order actually changes the observed outcome.
+  (h) substrate.py (issue #20) injects a crash/torn-write at a configured
+      I/O point deterministically for a fixed seed, discards only
+      unfsync'd data on a plain crash, and its virtual clock advances
+      correctly - all with no real filesystem or wall-clock touched.
 
 Deliberately does NOT check that any specific test can detect any specific
 operator's defect - doing so would mean writing a golden/answer test into
@@ -49,6 +53,7 @@ import tempfile
 
 import mutate
 import scheduler
+import substrate
 
 HERE = pathlib.Path(__file__).resolve().parent
 CLEAN = HERE / "clean"
@@ -143,6 +148,69 @@ def check_scheduler_is_deterministic_and_usable_standalone() -> None:
         ok("scheduler.py: permutation order changes the observed read, as expected (whichever UPDATE step runs first claims the row)")
     else:
         fail(f"scheduler.py: expected forward read ((2,),) and reverse read ((3,),), got {forward_read.rows!r} and {reverse_read.rows!r}")
+
+
+def check_substrate_is_deterministic() -> None:
+    """#20's acceptance criteria, checked directly rather than just
+    asserted: (1) VirtualVFS can inject a crash/torn-write at a
+    configured I/O point; (2) the outcome is deterministic for a fixed
+    seed, across repeated trials; (3) a plain (non-torn) crash discards
+    only unfsync'd bytes; (4) the torn-write cut point genuinely depends
+    on the seed (not hardcoded to keep everything or nothing); (5) the
+    virtual clock advances correctly. No real filesystem or wall-clock is
+    touched anywhere in this - see substrate.py's own docstring.
+    """
+
+    def run(seed: int, torn: bool) -> bytes:
+        sim = substrate.Simulation(seed)
+        sim.vfs.write("wal", b"AAAA")
+        sim.vfs.fsync("wal")
+        sim.vfs.write("wal", b"BBBB")  # never fsync'd - must not survive any crash
+        sim.vfs.crash(torn=torn)
+        sim.vfs.restart()
+        return sim.vfs.read("wal")
+
+    clean = run(42, torn=False)
+    if clean != b"AAAA":
+        fail(f"substrate.py: a non-torn crash should keep exactly the fsync'd bytes, got {clean!r}")
+    elif all(run(42, torn=False) == clean for _ in range(5)):
+        ok("substrate.py: VirtualVFS crash discards unfsync'd writes and keeps durable ones, deterministically (seed 42)")
+    else:
+        fail("substrate.py: VirtualVFS crash/restart is not deterministic across repeated trials with the same seed")
+
+    torn = run(42, torn=True)
+    if not (len(torn) <= 4 and b"AAAA".startswith(torn)):
+        fail(f"substrate.py: a torn crash should truncate the durable bytes to a prefix of {b'AAAA'!r}, got {torn!r}")
+    elif all(run(42, torn=True) == torn for _ in range(5)):
+        ok(f"substrate.py: VirtualVFS torn-write truncation is deterministic across repeated trials (seed 42 -> {torn!r})")
+    else:
+        fail("substrate.py: VirtualVFS torn-write truncation is not deterministic across repeated trials with the same seed")
+
+    cuts_by_seed = {seed: run(seed, torn=True) for seed in range(20)}
+    if len(set(cuts_by_seed.values())) <= 1:
+        fail(f"substrate.py: torn-write cut point never varies across 20 different seeds: {cuts_by_seed}")
+    else:
+        ok("substrate.py: torn-write cut point genuinely depends on the seed, not hardcoded")
+
+    sim = substrate.Simulation(1)
+    sim.vfs.configure_crash_after(2, torn=False)
+    sim.vfs.write("wal", b"A")  # I/O op 1 - must not trigger the configured crash yet
+    if sim.vfs.crashed:
+        fail("substrate.py: configure_crash_after(2) crashed after only 1 I/O op")
+    else:
+        sim.vfs.write("wal", b"B")  # I/O op 2 - the configured crash point
+        if sim.vfs.crashed:
+            ok("substrate.py: VirtualVFS.configure_crash_after() auto-crashes at exactly the configured I/O point")
+        else:
+            fail("substrate.py: configure_crash_after(2) did not auto-crash at the 2nd I/O op")
+
+    clock = substrate.VirtualClock()
+    clock.advance(substrate.parse_duration("10s"))
+    clock.advance(substrate.parse_duration("500ms"))
+    if clock.now() == 10.5:
+        ok("substrate.py: VirtualClock.advance() + parse_duration() compose correctly (10s + 500ms = 10.5)")
+    else:
+        fail(f"substrate.py: expected VirtualClock.now() == 10.5 after advancing 10s then 500ms, got {clock.now()}")
 
 
 def check_operators(tmp: pathlib.Path) -> None:
@@ -265,6 +333,7 @@ def main() -> int:
     check_official_suite_passes_on_clean()
     check_oracle_agrees_with_clean()
     check_scheduler_is_deterministic_and_usable_standalone()
+    check_substrate_is_deterministic()
     check_selection_is_deterministic_and_covers_all_operators()
     with tempfile.TemporaryDirectory(prefix="tinytable-evals-selfcheck-") as td:
         tmp = pathlib.Path(td)

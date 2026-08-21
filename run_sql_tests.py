@@ -15,8 +15,11 @@ first root's code if this were ever asked to compare two roots in one run.
 The grammar carries a version number (SPEC.md's "Grammar version"); v2 adds
 session/step/permutation, crash/restart/checkpoint, repeat/advance_clock/
 threshold, and explain/assert-stats records on top of v1's statement/query.
-Several v2 record kinds don't have a `tinytable` feature to execute against
-yet (no persistence layer, no planner, no stats interface) - those are
+crash/restart/checkpoint/advance_clock run against a per-file, seeded
+substrate.Simulation (#20; see --sim-seed below) but aren't wired to
+`tinytable` itself yet (no persistence layer exists until #11's WAL
+lands there). explain/assert-stats still have no `tinytable` feature to
+execute against at all (no planner, no stats interface) - those two are
 reported as SKIPPED, not failed, and don't affect the exit code. See
 SPEC.md's "Execution status summary" table for exactly which.
 
@@ -33,6 +36,7 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 import scheduler
+import substrate
 
 
 SUPPORTED_GRAMMAR_VERSIONS = ("1", "2")
@@ -85,6 +89,7 @@ class PermutationRecord:
 class LifecycleRecord:
     kind: str  # "crash" | "restart" | "checkpoint"
     line: int
+    torn: bool = False  # crash-only: also truncate durable (fsync'd) bytes to a random prefix - see substrate.py
 
 
 @dataclass
@@ -259,10 +264,14 @@ def _parse_block(lines: list[str], i: int, n: int, path: pathlib.Path, *, in_rep
             records.append(PermutationRecord(steps=steps, line=header_line_no))
 
         elif head in _LIFECYCLE_KINDS:
-            if len(parts) != 1:
-                raise TestFileError(f"{path}:{header_line_no}: {head!r} takes no arguments")
+            torn = False
+            if len(parts) == 2 and head == "crash" and parts[1] == "torn":
+                torn = True
+            elif len(parts) != 1:
+                expected = "'crash' or 'crash torn'" if head == "crash" else f"{head!r}"
+                raise TestFileError(f"{path}:{header_line_no}: {head!r} takes no arguments (expected {expected})")
             i += 1
-            records.append(LifecycleRecord(kind=head, line=header_line_no))
+            records.append(LifecycleRecord(kind=head, line=header_line_no, torn=torn))
 
         elif head == "repeat":
             if len(parts) != 3 or parts[2] != "{":
@@ -472,7 +481,29 @@ def _execute_stats_assert(record: StatsAssertRecord, db, failures: list[tuple[in
         failures.append((record.line, f"assert stats {record.stat} {record.op} {record.bound}: actual={actual}"))
 
 
-def _execute_records(records: list[Record], db, state: _ExecState, failures: list[tuple[int, str]], skips: list[tuple[int, str]]) -> None:
+def _execute_lifecycle(record: LifecycleRecord, sim: substrate.Simulation, failures: list[tuple[int, str]]) -> None:
+    if record.kind == "checkpoint":
+        sim.vfs.checkpoint()
+    elif record.kind == "crash":
+        sim.vfs.crash(torn=record.torn)
+    else:
+        assert record.kind == "restart"
+        sim.vfs.restart()
+    # #20's substrate.py is exercised (deterministically, given --sim-seed)
+    # but not yet wired to `db` itself - no persistence layer exists until
+    # #11's WAL lands there, so this has no SQL-visible effect yet.
+
+
+def _execute_advance_clock(record: AdvanceClockRecord, sim: substrate.Simulation, failures: list[tuple[int, str]]) -> None:
+    try:
+        seconds = substrate.parse_duration(record.duration)
+    except ValueError as exc:
+        failures.append((record.line, str(exc)))
+        return
+    sim.clock.advance(seconds)
+
+
+def _execute_records(records: list[Record], db, state: _ExecState, failures: list[tuple[int, str]], skips: list[tuple[int, str]], sim: substrate.Simulation) -> None:
     for record in records:
         if isinstance(record, VersionRecord):
             continue
@@ -485,12 +516,12 @@ def _execute_records(records: list[Record], db, state: _ExecState, failures: lis
         elif isinstance(record, PermutationRecord):
             _execute_permutation(record, db, state, failures)
         elif isinstance(record, LifecycleRecord):
-            skips.append((record.line, f"{record.kind}: no runtime effect yet (see SPEC.md's Execution status summary)"))
+            _execute_lifecycle(record, sim, failures)
         elif isinstance(record, RepeatRecord):
             for _ in range(record.count):
-                _execute_records(record.body, db, state, failures, skips)
+                _execute_records(record.body, db, state, failures, skips, sim)
         elif isinstance(record, AdvanceClockRecord):
-            skips.append((record.line, f"advance_clock {record.duration}: no virtual clock yet (see SPEC.md's Execution status summary)"))
+            _execute_advance_clock(record, sim, failures)
         elif isinstance(record, ThresholdRecord):
             skips.append((record.line, f"threshold {record.stat} {record.op} {record.bound}: recorded, not yet enforced (see SPEC.md's Execution status summary)"))
         elif isinstance(record, ExplainRecord):
@@ -501,14 +532,17 @@ def _execute_records(records: list[Record], db, state: _ExecState, failures: lis
             raise AssertionError(f"unhandled record type: {type(record)}")  # pragma: no cover
 
 
-def run_file(path: pathlib.Path, tinytable) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+def run_file(path: pathlib.Path, tinytable, sim_seed: int = 0) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
     """Returns (failures, skips) - see module docstring: a skip doesn't
-    count as a failure."""
+    count as a failure. `sim_seed` seeds this file's substrate.Simulation
+    (crash/restart/checkpoint/advance_clock - #20); same seed, same file
+    -> byte-identical run, per substrate.py's own determinism contract."""
     records = parse_test_file(path)
     db = tinytable.Database()
+    sim = substrate.Simulation(sim_seed)
     failures: list[tuple[int, str]] = []
     skips: list[tuple[int, str]] = []
-    _execute_records(records, db, _ExecState(), failures, skips)
+    _execute_records(records, db, _ExecState(), failures, skips, sim)
     return failures, skips
 
 
@@ -526,6 +560,11 @@ def collect_test_files(paths: list[str]) -> list[pathlib.Path]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--root", required=True, help="directory containing a tinytable/ package to test")
+    parser.add_argument(
+        "--sim-seed", type=int, default=0,
+        help="seed for each file's substrate.Simulation (crash/restart/checkpoint/advance_clock, #20); "
+        "same seed -> byte-identical run (default: 0)",
+    )
     parser.add_argument("paths", nargs="+", help="*.test files, or directories to search for them")
     args = parser.parse_args()
 
@@ -542,7 +581,7 @@ def main() -> int:
     total_skips = 0
     for path in files:
         try:
-            failures, skips = run_file(path, tinytable)
+            failures, skips = run_file(path, tinytable, sim_seed=args.sim_seed)
         except TestFileError as exc:
             print(f"FAIL {path} (malformed test file)")
             print(f"  {exc}")
