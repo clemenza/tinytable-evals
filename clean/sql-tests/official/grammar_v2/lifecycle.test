@@ -1,9 +1,12 @@
 version 2
 
-# crash / restart / checkpoint - SPEC.md's "v2: lifecycle" section. No
-# persistence layer exists yet (pending #11's WAL/crash-recovery milestone
-# and #20's deterministic simulation substrate), so run_sql_tests.py
-# reports these as skipped rather than executing or failing them.
+# crash / restart / checkpoint - SPEC.md's "v2: lifecycle" section. As of
+# #20 these genuinely execute against the file's own seeded
+# substrate.Simulation (run_sql_tests.py --sim-seed) - checkpoint/crash/
+# restart on its virtual filesystem - but nothing wires `tinytable` itself
+# to that VFS yet (no persistence layer exists until #11's WAL milestone),
+# so none of it is visible to the SQL below: the table's own state is
+# untouched by any of these three lines.
 
 statement ok
 CREATE TABLE t (x INTEGER)
@@ -13,7 +16,7 @@ INSERT INTO t VALUES (1)
 
 checkpoint
 
-crash
+crash torn
 
 restart
 

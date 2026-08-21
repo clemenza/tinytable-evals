@@ -31,6 +31,15 @@ copy of `clean/`, and never committed anywhere.
   `permutation` records; `run_sql_tests.py` is one caller of it, but it's
   a standalone module a future isolation-test suite (#10) can import and
   drive directly, with no `.test` file involved.
+- **`substrate.py`** - the deterministic simulation substrate (issue #20):
+  a seeded `Simulation` bundling a virtual clock, an in-memory virtual
+  filesystem with injectable crash/torn-write failure, and a virtual
+  network (latency/reordering/partition/loss, reserved for future HA
+  work) - every future nondeterministic engine feature is meant to route
+  through this instead of a real clock/filesystem/`random`. Drives
+  `run_sql_tests.py`'s `crash`/`restart`/`checkpoint`/`advance_clock`
+  directives today (`--sim-seed`); #11's WAL/crash-recovery is the first
+  engine feature meant to wire `tinytable` itself into the VFS.
 - **`mutate.py`** - the mutation operator library: a fixed set of
   single-hunk, SPEC-violating edits to `clean/tinytable`, each targeting
   one specific behavioral guarantee from SPEC.md, plus `select_operator(seed)`
@@ -73,6 +82,7 @@ DIR/
   findings.schema.json
   run_sql_tests.py
   scheduler.py
+  substrate.py
 ```
 
 It prints a `SEED_ROOT_JSON: {...}` line to stdout naming the seed and the

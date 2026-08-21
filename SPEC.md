@@ -661,12 +661,20 @@ layered on top of `scheduler.py` rather than duplicated into it.
 
 ### v2: lifecycle - `crash` / `restart` / `checkpoint`
 
-Bare, argument-less directives marking points in a script where the engine
-should crash, restart, or checkpoint. `tinytable` has no persistence layer
-yet (that's milestone 5, #11, together with #20's deterministic simulation
-substrate), so today these are recognized by the grammar and reported as
-**skipped** (not failed, not silently ignored) rather than pretending to
-exercise crash recovery that doesn't exist yet:
+Directives marking points in a script where the engine should crash,
+restart, or checkpoint. `crash` optionally takes `torn` (`crash torn`);
+`restart` and `checkpoint` stay argument-less. As of #20, these run
+against that `.test` file's own seeded `substrate.Simulation` (see
+`run_sql_tests.py --sim-seed`, default `0`): `checkpoint` calls
+`Simulation.vfs.checkpoint()` (fsyncs every tracked virtual file),
+`crash`/`crash torn` calls `Simulation.vfs.crash(torn=...)`, and
+`restart` calls `Simulation.vfs.restart()`. `tinytable` has no
+persistence layer yet (that's milestone 5, #11) and nothing wires
+`Database` to this `Simulation` yet, so none of this has an SQL-visible
+effect - but it is genuinely exercised and deterministic (same
+`--sim-seed`, same file, same crash/torn-write outcome), not silently
+ignored, and not merely parsed-and-skipped either. #11's WAL is the
+first feature meant to wire the engine itself into the same VFS.
 
 ```
 step s1a
@@ -674,7 +682,7 @@ INSERT INTO t VALUES (1)
 
 checkpoint
 
-crash
+crash torn
 
 restart
 ```
@@ -697,13 +705,15 @@ DELETE FROM t WHERE x = 1
 }
 ```
 
-`advance_clock <duration>` (e.g. `advance_clock 10s`) and
-`threshold <stat> <op> <bound>` (e.g. `threshold retry_count <= 3`) are
-single-line, argument-carrying directives for scripts that need a virtual
-clock or a soak-test bound. Like the lifecycle directives above, both are
-grammar-only today - they parse and are reported as skipped pending #20's
-virtual clock and #21's Grader v2 stats plumbing, which will give them
-runtime effect without any further grammar change.
+`advance_clock <duration>` (e.g. `advance_clock 10s`; also `ms`/`m`/`h`)
+calls `Simulation.clock.advance()` on the file's own seeded substrate
+(#20) - genuinely executed, though nothing in `tinytable` reads the clock
+yet (no TTL/retention feature exists), so it has no SQL-visible effect
+either, same caveat as the lifecycle directives above.
+`threshold <stat> <op> <bound>` (e.g. `threshold retry_count <= 3`) is
+still grammar-only: it parses and is reported as skipped pending #21's
+Grader v2 stats plumbing, which will give it runtime effect without any
+further grammar change.
 
 ### v2: `EXPLAIN` and `assert stats`
 
@@ -743,9 +753,9 @@ assert stats retry_count converges
 | `version` | v2 | validated, no runtime effect |
 | `statement`, `query` | v1 | full |
 | `session` / `step` / `permutation` | v2 | full, via `scheduler.py` (#19); MVCC-aware visibility needs #10 |
-| `crash` / `restart` / `checkpoint` | v2 | skipped (needs #11 WAL, #20 substrate) |
+| `crash` / `restart` / `checkpoint` | v2 | full against `substrate.py`'s VFS (#20); no SQL-visible effect until #11 WAL |
 | `repeat N { ... }` | v2 | full |
-| `advance_clock` | v2 | skipped (needs #20 virtual clock) |
+| `advance_clock` | v2 | full against `substrate.py`'s clock (#20); no SQL-visible effect until a TTL/retention feature reads it |
 | `threshold` | v2 | skipped (needs #21 Grader v2) |
 | `explain` | v2 | skipped (needs #12 planner) |
 | `assert stats` | v2 | skipped (needs #21/#22 stats interface) |
