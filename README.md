@@ -38,6 +38,10 @@ copy of `clean/`, and never committed anywhere.
   (`findings.schema.json` is the schema for that file).
 - **`selfcheck.py`** - a standalone QA pass over this repo's own machinery
   (see "Why no golden tests" below).
+- **`oracle.py`** - the differential oracle: replays a `.test` corpus
+  against both `tinytable` and `sqlite3` (stdlib) and reports where their
+  results disagree, so a claimed defect can be checked against real SQL
+  semantics instead of argued about. See "The differential oracle" below.
 
 ## The two-CLI integration surface
 
@@ -103,6 +107,35 @@ exactly one contiguous hunk, and - critically - `clean/sql-tests/official/`
 still passes against the mutant. That last check is the load-bearing one:
 it proves the defect doesn't announce itself to the existing acceptance
 suite, without ever writing down what would catch it.
+
+## The differential oracle
+
+```sh
+python3 oracle.py --root clean clean/sql-tests/official
+```
+
+`tinytable`'s current SQL surface (SPEC.md's grammar) is a subset of real
+SQL, so for any `.test` file, `sqlite3` is an independent, non-tinytable
+ground truth for what a `query` record's result *should* be. `oracle.py`
+replays a file's `statement`/`query` records against a fresh `tinytable`
+`Database` and a fresh `sqlite3 :memory:` connection side by side, applying
+each statement to the sqlite3 side only if `tinytable` itself accepted it
+(so tinytable's intentionally stricter column-type checking - see "Column
+Types" in SPEC.md - never desyncs the two engines' state), and compares
+every `query` record's actual result between the two - not against the
+file's own hardcoded expected block, which `run_sql_tests.py` already
+checks. `selfcheck.py` runs it against `clean/sql-tests/official/` as part
+of its own checks: zero disagreements there means `clean/tinytable` isn't
+merely self-consistent, it matches real SQL semantics.
+
+This is `#3`'s differential-oracle piece, landed ahead of any of `#3`'s new
+feature milestones so each one gets it "for free": a milestone's own
+`.test` corpus runs through this same file unchanged, for as long as that
+feature stays inside SQL sqlite3 also implements. A future feature that
+goes beyond what sqlite3 supports (e.g. genuine MVCC/WAL semantics) is out
+of the oracle's reach by construction and needs its own operator-level
+proof instead, same as `selfcheck.py` already does for every current
+operator (see "Why no golden tests" above).
 
 ## Context
 
