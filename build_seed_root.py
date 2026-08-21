@@ -18,6 +18,7 @@ repo's mutation operator library and applies it to a fresh copy of
       run_sql_tests.py
       scheduler.py             run_sql_tests.py's permutation executor (#19)
       substrate.py             deterministic simulation substrate (#20)
+      admissibility.py         history-admissibility checker (#21)
 
 `DIR` is git-initialized and committed as the pristine baseline, matching
 what `grade.py` expects (it uses `git status` to confirm the agent left
@@ -72,6 +73,7 @@ def build_seed_root(seed: int, out: pathlib.Path) -> mutate.Operator:
     shutil.copy2(HERE / "run_sql_tests.py", out / "run_sql_tests.py")
     shutil.copy2(HERE / "scheduler.py", out / "scheduler.py")  # run_sql_tests.py's own permutation executor (#19) imports this
     shutil.copy2(HERE / "substrate.py", out / "substrate.py")  # run_sql_tests.py's own crash/restart/checkpoint/advance_clock executor (#20) imports this
+    shutil.copy2(HERE / "admissibility.py", out / "admissibility.py")  # run_sql_tests.py's own --check-admissibility (#21) imports this
     shutil.copy2(HERE / "SPEC.md", out / "SPEC.md")
     shutil.copy2(HERE / "task-prompt.md", out / "task-prompt.md")
     shutil.copy2(HERE / "findings.schema.json", out / "findings.schema.json")

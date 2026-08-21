@@ -659,6 +659,15 @@ exploring every interleaving of a step set (rather than running the exact
 `permutation`s a script lists) is #23's isolationtester-style framework,
 layered on top of `scheduler.py` rather than duplicated into it.
 
+`run_sql_tests.py --check-admissibility` (#21, off by default) runs each
+`permutation`'s resulting history through `admissibility.py`'s conflict-
+serializability checker, reporting a `[admissibility]`-tagged failure if
+no serial (one-session-at-a-time) order could have produced what was
+observed - a second, automatic way for a `.test` file to "kill" a defect,
+alongside an explicit `query`/`step ... error` assertion. See
+`admissibility.py`'s own docstring for the algorithm and its table-
+granularity simplification.
+
 ### v2: lifecycle - `crash` / `restart` / `checkpoint`
 
 Directives marking points in a script where the engine should crash,
@@ -735,15 +744,21 @@ exact-value assertions - `converges` means "stops changing under repeated
 identical operations" and `bounded` means "stays within a limit", which is
 what a long-soak run can actually promise about, say, an index's entry
 count or a retry counter (an exact value would overfit to one run's timing
-or scheduling). Both forms are recorded records from day one, but need a
-query planner (`EXPLAIN`, milestone 6/#12) or a stats interface
-(`assert stats`, #21/#22) `tinytable` doesn't have yet, so `run_sql_tests.py`
-reports them as skipped until those land - at which point this grammar
-does not need to change, only the runner's execution of it.
+or scheduling). As of #21, `Database.stats()` exists and `assert stats`
+genuinely executes; `converges` still has nothing to check against a
+single sample (it needs a history across `repeat` iterations, not yet
+implemented) so it always passes today, same as documented for `explain`
+below.
+Available stat names today (each a total across every table): `table_count`,
+`row_count`, `index_count`, `unique_index_count`, `open_savepoint_count`.
+`explain` still needs a query planner (milestone 6/#12) `tinytable`
+doesn't have yet, so `run_sql_tests.py` keeps reporting it as skipped
+until that lands - at which point this grammar does not need to change,
+only the runner's execution of it.
 
 ```
-assert stats index_lookup_count bounded <= 100
-assert stats retry_count converges
+assert stats row_count bounded <= 100
+assert stats table_count converges
 ```
 
 ### Execution status summary
@@ -756,9 +771,9 @@ assert stats retry_count converges
 | `crash` / `restart` / `checkpoint` | v2 | full against `substrate.py`'s VFS (#20); no SQL-visible effect until #11 WAL |
 | `repeat N { ... }` | v2 | full |
 | `advance_clock` | v2 | full against `substrate.py`'s clock (#20); no SQL-visible effect until a TTL/retention feature reads it |
-| `threshold` | v2 | skipped (needs #21 Grader v2) |
+| `threshold` | v2 | skipped (needs history-across-`repeat`-iterations plumbing, not yet implemented) |
 | `explain` | v2 | skipped (needs #12 planner) |
-| `assert stats` | v2 | skipped (needs #21/#22 stats interface) |
+| `assert stats` | v2 | full, via `Database.stats()` (#21); `converges` always passes until the same plumbing lands |
 
 A "skipped" record is reported distinctly from a failure and never counts
 against a run's exit code - see `run_sql_tests.py`'s own output.

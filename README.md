@@ -40,6 +40,16 @@ copy of `clean/`, and never committed anywhere.
   `run_sql_tests.py`'s `crash`/`restart`/`checkpoint`/`advance_clock`
   directives today (`--sim-seed`); #11's WAL/crash-recovery is the first
   engine feature meant to wire `tinytable` itself into the VFS.
+- **`admissibility.py`** - a self-built conflict-serializability checker
+  over a recorded read/write history (issue #21's "history admissibility
+  check"): given a `scheduler.ScheduleResult`, reconstructs which table
+  each step read/wrote (by parsing its SQL, table-granularity - a
+  documented simplification, same trade-off as #10's MVCC conflict check)
+  and detects a cycle in the resulting precedence graph, a live witness
+  that no serial (one-session-at-a-time) execution could have produced
+  the observed history. Wired into `run_sql_tests.py --check-
+  admissibility` (opt-in, off by default) and `grade.py --check-
+  admissibility`.
 - **`mutate.py`** - the mutation operator library: a fixed set of
   single-hunk, SPEC-violating edits to `clean/tinytable`, each targeting
   one specific behavioral guarantee from SPEC.md, plus `select_operator(seed)`
@@ -83,6 +93,7 @@ DIR/
   run_sql_tests.py
   scheduler.py
   substrate.py
+  admissibility.py
 ```
 
 It prints a `SEED_ROOT_JSON: {...}` line to stdout naming the seed and the
@@ -95,19 +106,28 @@ was injected or that any bookkeeping about it exists.
 submission purely from what's on disk - it never needs to know which
 operator or seed produced `DIR/tinytable/`:
 
-1. Run the agent's `sql-tests/agent/` against `DIR`'s own (mutated)
-   `tinytable/` -> the failing set `F_mutant`.
-2. Run the same tests against a fresh copy of this repo's `clean/` ->
-   `F_clean`.
-3. `killed = bool(F_mutant - F_clean)` (the agent found something real);
-   `false_alarms = len(F_clean)` (a test that fails even against the
+1. For each of `--runs` seeds (default 1 - #21's probabilistic-kill
+   strategy for nondeterministic bugs, off by default): run the agent's
+   `sql-tests/agent/` against `DIR`'s own (mutated) `tinytable/` -> the
+   failing set `F_mutant`, each failure tagged by which kind of record
+   caught it.
+2. Run the same tests (same seed) against a fresh copy of this repo's
+   `clean/` -> `F_clean`.
+3. `kill_rate = (seeds where F_mutant - F_clean is nonempty) / --runs`;
+   `killed = kill_rate >= --kill-rate-threshold` (default 1.0, so
+   `--runs 1` reproduces the original all-or-nothing behavior exactly);
+   `false_alarms` = total `F_clean` count across every seed - zero iff
+   *every* seed's clean run was clean (a test that fails even against the
    reference implementation doesn't count - see task-prompt.md's
-   anti-cheat notice); `contract_ok` requires a non-empty
+   anti-cheat notice); `killed_by_kind` splits killed tests into
+   `"invariant"` (an `assert stats` or `--check-admissibility` violation)
+   vs. plain `"assertion"`; `contract_ok` requires a non-empty
    `sql-tests/agent/`, a schema-valid `findings.json`, and (via `git
    status` against the baseline `build_seed_root.py` committed)
    `tinytable/` and `sql-tests/official/` left untouched.
-4. Writes `score.json` and prints `SCORE_JSON: {...}`; exit 0 iff `killed
-   and false_alarms == 0 and contract_ok`.
+4. Writes `score.json` (including a `per_run` breakdown) and prints
+   `SCORE_JSON: {...}`; exit 0 iff `killed and false_alarms == 0 and
+   contract_ok`.
 
 ## Why no golden tests
 

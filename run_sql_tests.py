@@ -18,10 +18,19 @@ threshold, and explain/assert-stats records on top of v1's statement/query.
 crash/restart/checkpoint/advance_clock run against a per-file, seeded
 substrate.Simulation (#20; see --sim-seed below) but aren't wired to
 `tinytable` itself yet (no persistence layer exists until #11's WAL
-lands there). explain/assert-stats still have no `tinytable` feature to
-execute against at all (no planner, no stats interface) - those two are
-reported as SKIPPED, not failed, and don't affect the exit code. See
-SPEC.md's "Execution status summary" table for exactly which.
+lands there). `assert stats` genuinely executes (#21 gave Database a
+stats() interface); `explain` still has no `tinytable` feature to execute
+against at all (no planner) and is reported as SKIPPED, not failed - it
+doesn't affect the exit code. See SPEC.md's "Execution status summary"
+table for exactly which.
+
+Every failure message is tagged "[record_kind] ..." (statement/query/
+step/permutation/explain/assert_stats/advance_clock/admissibility) -
+grade.py (#21) parses this to classify what killed a mutant into
+score.json's killed_by_kind. --check-admissibility (off by default) runs
+every `permutation` record's observed history through admissibility.py's
+conflict-serializability check (#21), reported as a "[admissibility]"
+failure on violation.
 
 Exit code 0 iff every record in every file passed (skips don't count).
 """
@@ -35,6 +44,7 @@ import sys
 from dataclasses import dataclass
 from typing import Optional, Union
 
+import admissibility
 import scheduler
 import substrate
 
@@ -383,35 +393,45 @@ class _ExecState:
         self.permutation_baseline_taken = False
 
 
-def _execute_statement_like(kind: str, error_pattern: Optional[str], sql: str, line: int, db, failures: list[tuple[int, str]], label: str) -> None:
+# Every failure message is prefixed "[record_kind] " - grade.py (#21)
+# parses this tag to classify what killed a mutant (an ordinary assertion
+# vs. an "invariant" - assert_stats/admissibility - violation) into
+# score.json's killed_by_kind. Kept as a plain string prefix, not a
+# separate field, so run_sql_tests.py's own line-oriented output format
+# doesn't have to change shape for it.
+def _tag(record_kind: str, message: str) -> str:
+    return f"[{record_kind}] {message}"
+
+
+def _execute_statement_like(record_kind: str, kind: str, error_pattern: Optional[str], sql: str, line: int, db, failures: list[tuple[int, str]], label: str) -> None:
     try:
         db.execute(sql)
         error: Optional[Exception] = None
     except Exception as exc:  # noqa: BLE001 - deliberately broad, this is a test harness
         error = exc
     if kind == "ok" and error is not None:
-        failures.append((line, f"{label}expected to succeed but raised {type(error).__name__}: {error}\n    sql: {sql}"))
+        failures.append((line, _tag(record_kind, f"{label}expected to succeed but raised {type(error).__name__}: {error}\n    sql: {sql}")))
     elif kind == "error" and error is None:
-        failures.append((line, f"{label}expected to raise but succeeded\n    sql: {sql}"))
+        failures.append((line, _tag(record_kind, f"{label}expected to raise but succeeded\n    sql: {sql}")))
     elif kind == "error" and error is not None and error_pattern and error_pattern not in str(error):
-        failures.append((line, f"{label}raised {type(error).__name__}({error!r}) but that does not contain expected text {error_pattern!r}\n    sql: {sql}"))
+        failures.append((line, _tag(record_kind, f"{label}raised {type(error).__name__}({error!r}) but that does not contain expected text {error_pattern!r}\n    sql: {sql}")))
 
 
 def _execute_query(record: QueryRecord, db, failures: list[tuple[int, str]]) -> None:
     try:
         result = db.execute(record.sql)
     except Exception as exc:  # noqa: BLE001
-        failures.append((record.line, f"query raised {type(exc).__name__}: {exc}\n    sql: {record.sql}"))
+        failures.append((record.line, _tag("query", f"query raised {type(exc).__name__}: {exc}\n    sql: {record.sql}")))
         return
     problem = _check_query(record, result.columns, result.rows)
     if problem:
-        failures.append((record.line, f"{problem}\n    sql: {record.sql}"))
+        failures.append((record.line, _tag("query", f"{problem}\n    sql: {record.sql}")))
 
 
-def _execute_permutation(record: PermutationRecord, db, state: _ExecState, failures: list[tuple[int, str]]) -> None:
+def _execute_permutation(record: PermutationRecord, db, state: _ExecState, failures: list[tuple[int, str]], check_admissibility: bool, tinytable) -> None:
     missing = [name for name in record.steps if name not in state.step_lookup]
     if missing:
-        failures.append((record.line, f"permutation references unknown step(s): {missing}"))
+        failures.append((record.line, _tag("permutation", f"permutation references unknown step(s): {missing}")))
         return
 
     try:
@@ -421,7 +441,7 @@ def _execute_permutation(record: PermutationRecord, db, state: _ExecState, failu
             db.execute(f"SAVEPOINT {_PERMUTATION_BASELINE}")
             state.permutation_baseline_taken = True
     except Exception as exc:  # noqa: BLE001
-        failures.append((record.line, f"permutation {record.steps}: could not reset to baseline: {type(exc).__name__}: {exc}"))
+        failures.append((record.line, _tag("permutation", f"permutation {record.steps}: could not reset to baseline: {type(exc).__name__}: {exc}")))
         return
 
     # Delegate the actual interleaving to scheduler.py (#19) - this file's
@@ -441,13 +461,36 @@ def _execute_permutation(record: PermutationRecord, db, state: _ExecState, failu
         step = state.step_lookup[outcome.step]
         label = f"step {step.name!r}: "
         if step.kind == "ok":
-            failures.append((step.line, f"{label}expected to succeed but raised {outcome.raised}: {outcome.message}\n    sql: {step.sql}"))
+            failures.append((step.line, _tag("step", f"{label}expected to succeed but raised {outcome.raised}: {outcome.message}\n    sql: {step.sql}")))
         elif outcome.raised is None:
-            failures.append((step.line, f"{label}expected to raise but succeeded\n    sql: {step.sql}"))
+            failures.append((step.line, _tag("step", f"{label}expected to raise but succeeded\n    sql: {step.sql}")))
         else:
             failures.append(
-                (step.line, f"{label}raised {outcome.raised}({outcome.message!r}) but that does not contain expected text {step.error_pattern!r}\n    sql: {step.sql}")
+                (step.line, _tag("step", f"{label}raised {outcome.raised}({outcome.message!r}) but that does not contain expected text {step.error_pattern!r}\n    sql: {step.sql}"))
             )
+
+    if check_admissibility:
+        _check_admissibility(record, result, state, failures, tinytable)
+
+
+def _check_admissibility(record: PermutationRecord, result, state: _ExecState, failures: list[tuple[int, str]], tinytable) -> None:
+    """#21's "history admissibility check", opt-in (--check-admissibility):
+    is this permutation's observed history conflict-serializable? See
+    admissibility.py for the algorithm and its table-granularity
+    simplification. A step whose SQL admissibility.classify_step can't
+    classify (DDL, SAVEPOINT/etc.) is silently excluded from the history,
+    not an error - see build_history.
+    """
+    history = admissibility.build_history(
+        result,
+        classify=lambda sql: admissibility.classify_step(tinytable, sql),
+        steps={name: scheduler.Step(session=s.session, name=s.name, sql=s.sql, kind=s.kind, error_pattern=s.error_pattern) for name, s in state.step_lookup.items()},
+    )
+    admissible, cycle = admissibility.is_serializable(history)
+    if not admissible:
+        failures.append(
+            (record.line, _tag("admissibility", f"permutation {record.steps}: observed history is not conflict-serializable - witnessing cycle: {' -> '.join(cycle)}"))
+        )
 
 
 def _execute_explain(record: ExplainRecord, db, failures: list[tuple[int, str]], skips: list[tuple[int, str]]) -> None:
@@ -458,10 +501,10 @@ def _execute_explain(record: ExplainRecord, db, failures: list[tuple[int, str]],
     try:
         plan_lines = list(explain(record.sql))
     except Exception as exc:  # noqa: BLE001
-        failures.append((record.line, f"explain raised {type(exc).__name__}: {exc}\n    sql: {record.sql}"))
+        failures.append((record.line, _tag("explain", f"explain raised {type(exc).__name__}: {exc}\n    sql: {record.sql}")))
         return
     if plan_lines != record.expected:
-        failures.append((record.line, f"explain mismatch:\n    expected: {record.expected}\n    actual:   {plan_lines}\n    sql: {record.sql}"))
+        failures.append((record.line, _tag("explain", f"explain mismatch:\n    expected: {record.expected}\n    actual:   {plan_lines}\n    sql: {record.sql}")))
 
 
 def _execute_stats_assert(record: StatsAssertRecord, db, failures: list[tuple[int, str]], skips: list[tuple[int, str]]) -> None:
@@ -471,14 +514,14 @@ def _execute_stats_assert(record: StatsAssertRecord, db, failures: list[tuple[in
         return
     values = stats()
     if record.stat not in values:
-        failures.append((record.line, f"assert stats {record.stat}: no such stat (available: {sorted(values)})"))
+        failures.append((record.line, _tag("assert_stats", f"assert stats {record.stat}: no such stat (available: {sorted(values)})")))
         return
     if record.mode == "converges":
         return  # convergence needs a history across repeat iterations, not a single sample; nothing to check here yet
     actual = values[record.stat]
     bound = type(actual)(record.bound)
     if not _STATS_OPS[record.op](actual, bound):
-        failures.append((record.line, f"assert stats {record.stat} {record.op} {record.bound}: actual={actual}"))
+        failures.append((record.line, _tag("assert_stats", f"assert stats {record.stat} {record.op} {record.bound}: actual={actual}")))
 
 
 def _execute_lifecycle(record: LifecycleRecord, sim: substrate.Simulation, failures: list[tuple[int, str]]) -> None:
@@ -498,28 +541,31 @@ def _execute_advance_clock(record: AdvanceClockRecord, sim: substrate.Simulation
     try:
         seconds = substrate.parse_duration(record.duration)
     except ValueError as exc:
-        failures.append((record.line, str(exc)))
+        failures.append((record.line, _tag("advance_clock", str(exc))))
         return
     sim.clock.advance(seconds)
 
 
-def _execute_records(records: list[Record], db, state: _ExecState, failures: list[tuple[int, str]], skips: list[tuple[int, str]], sim: substrate.Simulation) -> None:
+def _execute_records(
+    records: list[Record], db, state: _ExecState, failures: list[tuple[int, str]], skips: list[tuple[int, str]],
+    sim: substrate.Simulation, tinytable, check_admissibility: bool,
+) -> None:
     for record in records:
         if isinstance(record, VersionRecord):
             continue
         elif isinstance(record, StatementRecord):
-            _execute_statement_like(record.kind, record.error_pattern, record.sql, record.line, db, failures, label="")
+            _execute_statement_like("statement", record.kind, record.error_pattern, record.sql, record.line, db, failures, label="")
         elif isinstance(record, QueryRecord):
             _execute_query(record, db, failures)
         elif isinstance(record, StepRecord):
             state.step_lookup[record.name] = record  # declaration only; runs when a permutation names it
         elif isinstance(record, PermutationRecord):
-            _execute_permutation(record, db, state, failures)
+            _execute_permutation(record, db, state, failures, check_admissibility, tinytable)
         elif isinstance(record, LifecycleRecord):
             _execute_lifecycle(record, sim, failures)
         elif isinstance(record, RepeatRecord):
             for _ in range(record.count):
-                _execute_records(record.body, db, state, failures, skips, sim)
+                _execute_records(record.body, db, state, failures, skips, sim, tinytable, check_admissibility)
         elif isinstance(record, AdvanceClockRecord):
             _execute_advance_clock(record, sim, failures)
         elif isinstance(record, ThresholdRecord):
@@ -532,17 +578,19 @@ def _execute_records(records: list[Record], db, state: _ExecState, failures: lis
             raise AssertionError(f"unhandled record type: {type(record)}")  # pragma: no cover
 
 
-def run_file(path: pathlib.Path, tinytable, sim_seed: int = 0) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+def run_file(path: pathlib.Path, tinytable, sim_seed: int = 0, check_admissibility: bool = False) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
     """Returns (failures, skips) - see module docstring: a skip doesn't
     count as a failure. `sim_seed` seeds this file's substrate.Simulation
     (crash/restart/checkpoint/advance_clock - #20); same seed, same file
-    -> byte-identical run, per substrate.py's own determinism contract."""
+    -> byte-identical run, per substrate.py's own determinism contract.
+    `check_admissibility` (#21, default off) runs every `permutation`
+    record's resulting history through admissibility.py."""
     records = parse_test_file(path)
     db = tinytable.Database()
     sim = substrate.Simulation(sim_seed)
     failures: list[tuple[int, str]] = []
     skips: list[tuple[int, str]] = []
-    _execute_records(records, db, _ExecState(), failures, skips, sim)
+    _execute_records(records, db, _ExecState(), failures, skips, sim, tinytable, check_admissibility)
     return failures, skips
 
 
@@ -565,6 +613,11 @@ def main() -> int:
         help="seed for each file's substrate.Simulation (crash/restart/checkpoint/advance_clock, #20); "
         "same seed -> byte-identical run (default: 0)",
     )
+    parser.add_argument(
+        "--check-admissibility", action="store_true",
+        help="run every 'permutation' record's observed history through admissibility.py's "
+        "conflict-serializability check (#21); off by default",
+    )
     parser.add_argument("paths", nargs="+", help="*.test files, or directories to search for them")
     args = parser.parse_args()
 
@@ -581,7 +634,7 @@ def main() -> int:
     total_skips = 0
     for path in files:
         try:
-            failures, skips = run_file(path, tinytable, sim_seed=args.sim_seed)
+            failures, skips = run_file(path, tinytable, sim_seed=args.sim_seed, check_admissibility=args.check_admissibility)
         except TestFileError as exc:
             print(f"FAIL {path} (malformed test file)")
             print(f"  {exc}")
