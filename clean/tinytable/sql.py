@@ -39,7 +39,7 @@ _TOKEN_SPEC = [
     ("WS", r"[ \t\r\n]+"),
     ("STRING", r"'(?:[^']|'')*'"),
     ("NUMBER", r"\d+\.\d+|\d+"),
-    ("OP", r"<=|>=|!=|<>|[=<>(),.*]"),
+    ("OP", r"\|\||<=|>=|!=|<>|[=<>(),.*+/-]"),
     ("IDENT", r"[A-Za-z_][A-Za-z0-9_]*"),
 ]
 _MASTER_RE = re.compile("|".join(f"(?P<{name}>{pattern})" for name, pattern in _TOKEN_SPEC))
@@ -125,10 +125,38 @@ class Delete:
     where: Optional[Any]
 
 
+# Value-expression AST for a SELECT item (see "Expressions in SELECT" in
+# SPEC.md): arithmetic (+ - * /), string concatenation (||), unary minus,
+# and parenthesized grouping over columns/literals. Evaluated per row by
+# _eval_expr(); NOT part of WHERE's condition grammar, which stays
+# column-op-value only (see Cmp/BetweenNode/etc. below).
+@dataclass
+class ColumnRef:
+    name: str
+
+
+@dataclass
+class Literal:
+    value: Any
+
+
+@dataclass
+class UnaryMinus:
+    operand: Any
+
+
+@dataclass
+class BinOp:
+    op: str  # "+" | "-" | "*" | "/" | "||"
+    left: Any
+    right: Any
+
+
 @dataclass
 class SelectItem:
-    kind: str  # "star" | "column" | "count" | "min" | "max"
-    column: Optional[str] = None  # None means "*" for count
+    kind: str  # "star" | "expr" | "count" | "min" | "max"
+    column: Optional[str] = None  # count/min/max's argument column; None means "*" for count
+    expr: Optional[Any] = None  # set when kind == "expr"
 
 
 @dataclass
@@ -435,7 +463,66 @@ class Parser:
                     column = self._eat_ident()
                 self._eat_op(")")
                 return SelectItem(kind=kind, column=column)
-        return SelectItem(kind="column", column=self._eat_ident())
+        return SelectItem(kind="expr", expr=self._parse_concat())
+
+    # -- SELECT-item value-expression grammar (lowest to highest precedence:
+    # || , then + -, then * /, then unary -, then atoms) ---------------------
+
+    def _parse_concat(self):
+        left = self._parse_add()
+        while self._try_op("||"):
+            left = BinOp("||", left, self._parse_add())
+        return left
+
+    def _parse_add(self):
+        left = self._parse_mul()
+        while True:
+            if self._try_op("+"):
+                op = "+"
+            elif self._try_op("-"):
+                op = "-"
+            else:
+                return left
+            left = BinOp(op, left, self._parse_mul())
+
+    def _parse_mul(self):
+        left = self._parse_unary()
+        while True:
+            if self._try_op("*"):
+                op = "*"
+            elif self._try_op("/"):
+                op = "/"
+            else:
+                return left
+            left = BinOp(op, left, self._parse_unary())
+
+    def _parse_unary(self):
+        if self._try_op("-"):
+            return UnaryMinus(self._parse_unary())
+        return self._parse_atom()
+
+    def _parse_atom(self):
+        if self._try_op("("):
+            inner = self._parse_concat()
+            self._eat_op(")")
+            return inner
+        if self._at_keyword("NULL"):
+            self._advance()
+            return Literal(None)
+        if self._at_keyword("TRUE"):
+            self._advance()
+            return Literal(True)
+        if self._at_keyword("FALSE"):
+            self._advance()
+            return Literal(False)
+        tok = self._peek()
+        if tok.kind in ("NUMBER", "STRING"):
+            self._advance()
+            return Literal(tok.value)
+        if tok.kind == "IDENT":
+            self._advance()
+            return ColumnRef(tok.value)
+        raise SqlError(f"expected an expression, got {tok.kind} {tok.value!r} at position {tok.pos}")
 
     def _parse_optional_where(self):
         if self._try_keyword("WHERE"):
@@ -551,6 +638,91 @@ def _build_predicate(node) -> core.Predicate:
             result = (result | part) if node.op == "or" else (result & part)
         return result
     raise SqlError(f"unrecognized condition node: {node!r}")
+
+
+# ---------------------------------------------------------------------------
+# SELECT-item expression evaluation (see "Expressions in SELECT" in SPEC.md)
+# ---------------------------------------------------------------------------
+
+_NUMERIC_TYPES = (int, float)  # excludes bool on purpose: bool is a int
+# subclass in Python, but BOOLEAN is a distinct SQL type here (same spirit
+# as COLUMN_TYPES' exact `type(v) is expected` check) - it never silently
+# participates in arithmetic.
+
+
+def _eval_expr(node: Any, row: dict) -> Any:
+    """NULL propagates through every operator below: any NULL operand makes
+    the whole (sub)expression NULL, same as SPEC.md's WHERE-clause NULL
+    rule. Division by zero is NULL, not an error (matching real SQL - see
+    README/oracle.py). A type mismatch (e.g. '||' on a non-TEXT operand,
+    arithmetic on a non-numeric one) raises SqlError - exact-type-checking,
+    same spirit as COLUMN_TYPES, deliberately not coerced.
+    """
+    if isinstance(node, Literal):
+        return node.value
+    if isinstance(node, ColumnRef):
+        return row.get(node.name)
+    if isinstance(node, UnaryMinus):
+        v = _eval_expr(node.operand, row)
+        if v is None:
+            return None
+        if type(v) not in _NUMERIC_TYPES:
+            raise SqlError(f"unary '-' requires a numeric operand, got {type(v).__name__}: {v!r}")
+        return -v
+    if isinstance(node, BinOp):
+        left = _eval_expr(node.left, row)
+        right = _eval_expr(node.right, row)
+        if left is None or right is None:
+            return None
+        if node.op == "||":
+            if type(left) is not str or type(right) is not str:
+                raise SqlError(f"'||' requires TEXT operands, got {type(left).__name__} and {type(right).__name__}")
+            return left + right
+        if type(left) not in _NUMERIC_TYPES or type(right) not in _NUMERIC_TYPES:
+            raise SqlError(f"'{node.op}' requires numeric operands, got {type(left).__name__} and {type(right).__name__}")
+        if node.op == "+":
+            return left + right
+        if node.op == "-":
+            return left - right
+        if node.op == "*":
+            return left * right
+        if node.op == "/":
+            if right == 0:
+                return None
+            if type(left) is int and type(right) is int:
+                # Truncated (round-toward-zero) integer division, matching
+                # sqlite3's `/` between two INTEGERs - Python's `//` floors
+                # instead, which disagrees on mixed-sign operands.
+                magnitude = abs(left) // abs(right)
+                return -magnitude if (left < 0) != (right < 0) else magnitude
+            return left / right
+    raise SqlError(f"unrecognized expression node: {node!r}")
+
+
+def _select_item_label(item: SelectItem) -> str:
+    if item.kind != "expr":
+        return f"{item.kind}({item.column or '*'})"
+    return _render_expr(item.expr)
+
+
+def _render_expr(node: Any) -> str:
+    """Documentation-only reconstruction of an expression for its result
+    column's label - not checked against exact source text anywhere (see
+    run_sql_tests.py/oracle.py, which only ever compare row *values*).
+    """
+    if isinstance(node, Literal):
+        if node.value is None:
+            return "NULL"
+        if isinstance(node.value, str):
+            return f"'{node.value}'"
+        return str(node.value)
+    if isinstance(node, ColumnRef):
+        return node.name
+    if isinstance(node, UnaryMinus):
+        return f"-{_render_expr(node.operand)}"
+    if isinstance(node, BinOp):
+        return f"{_render_expr(node.left)}{node.op}{_render_expr(node.right)}"
+    return "<expr>"
 
 
 # ---------------------------------------------------------------------------
@@ -676,7 +848,7 @@ class Database:
         if stmt.offset is not None:
             query = query.offset(stmt.offset)
 
-        if any(item.kind != "column" and item.kind != "star" for item in stmt.items):
+        if any(item.kind != "expr" and item.kind != "star" for item in stmt.items):
             if len(stmt.items) != 1:
                 raise SqlError("an aggregate SELECT must have exactly one item (no mixing with plain columns)")
             item = stmt.items[0]
@@ -692,9 +864,10 @@ class Database:
         rows = query.all()
         if len(stmt.items) == 1 and stmt.items[0].kind == "star":
             columns = self._schemas.get(stmt.table) or (sorted({k for row in rows for k in row}) if rows else [])
+            result_rows = [tuple(row.get(col) for col in columns) for row in rows]
         else:
-            columns = [item.column for item in stmt.items]
-        result_rows = [tuple(row.get(col) for col in columns) for row in rows]
+            columns = [_select_item_label(item) for item in stmt.items]
+            result_rows = [tuple(_eval_expr(item.expr, row) for item in stmt.items) for row in rows]
         return QueryResult(columns=columns, rows=result_rows)
 
 

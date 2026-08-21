@@ -18,11 +18,13 @@ bottom, and keeps `apply_operator` a handful of lines.
 Every operator here targets one specific behavioral guarantee called out in
 SPEC.md (NULL three-valued logic, ORDER BY's stability and NULL placement,
 LIMIT/OFFSET ordering, index/rollback consistency, uniqueness semantics,
-aggregate NULL handling, exact type checking, or SELECT *'s column order)
-and is checked by `selfcheck.py` to (a) actually change the mutated file, (b)
-still parse as valid Python, and (c) still pass `clean/sql-tests/official`
-unmodified - i.e. the defect is real but doesn't announce itself to the
-existing acceptance suite.
+aggregate NULL handling, exact type checking, SELECT *'s column order, or
+- since issue #3's milestone 1 - SELECT-expression evaluation: division by
+zero, exact numeric typing excluding BOOLEAN, and truncating integer
+division) and is checked by `selfcheck.py` to (a) actually change the
+mutated file, (b) still parse as valid Python, and (c) still pass
+`clean/sql-tests/official` unmodified - i.e. the defect is real but doesn't
+announce itself to the existing acceptance suite.
 """
 
 from __future__ import annotations
@@ -268,6 +270,49 @@ OPERATORS: tuple[Operator, ...] = (
             "    def remove(self, value: Any, row_id: int) -> None:\n"
             "        if self._owner.get(value) == row_id:\n"
             "            del self._owner[value]\n"
+        ),
+    ),
+    Operator(
+        id="expr-division-by-zero-returns-zero",
+        file="sql.py",
+        spec_section="Expressions in SELECT",
+        find=(
+            "        if node.op == \"/\":\n"
+            "            if right == 0:\n"
+            "                return None\n"
+        ),
+        replace=(
+            "        if node.op == \"/\":\n"
+            "            if right == 0:\n"
+            "                return 0\n"
+        ),
+    ),
+    Operator(
+        id="expr-arithmetic-bool-not-excluded",
+        file="sql.py",
+        spec_section="Expressions in SELECT",
+        find=(
+            "        if type(left) not in _NUMERIC_TYPES or type(right) not in _NUMERIC_TYPES:\n"
+        ),
+        replace=(
+            "        if not isinstance(left, _NUMERIC_TYPES) or not isinstance(right, _NUMERIC_TYPES):\n"
+        ),
+    ),
+    Operator(
+        id="expr-integer-division-floors-instead-of-truncates",
+        file="sql.py",
+        spec_section="Expressions in SELECT",
+        find=(
+            "            if type(left) is int and type(right) is int:\n"
+            "                # Truncated (round-toward-zero) integer division, matching\n"
+            "                # sqlite3's `/` between two INTEGERs - Python's `//` floors\n"
+            "                # instead, which disagrees on mixed-sign operands.\n"
+            "                magnitude = abs(left) // abs(right)\n"
+            "                return -magnitude if (left < 0) != (right < 0) else magnitude\n"
+        ),
+        replace=(
+            "            if type(left) is int and type(right) is int:\n"
+            "                return left // right\n"
         ),
     ),
 )
