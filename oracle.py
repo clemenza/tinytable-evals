@@ -55,6 +55,18 @@ OFFSET n` (sqlite3's own idiom for "unlimited") before sending a query to
 sqlite3 - a syntax translation, not a semantic one, so it doesn't hide a
 real disagreement.
 
+## Grammar v2 record kinds
+
+`run_sql_tests.parse_test_file` (SPEC.md's "Test Script Format") also
+produces session/step/permutation, lifecycle, long-soak, and explain/stats
+record kinds beyond `StatementRecord`/`QueryRecord` (see issue #18). None of
+those have a sqlite3 equivalent - sqlite3 has no concept of tinytable's
+named sessions, crash/restart, or internal stats counters - so this file
+only ever compares `StatementRecord`/`QueryRecord` pairs, recursing into a
+`RepeatRecord`'s body (still plain SQL, just looped) and otherwise skipping
+anything else outright rather than asserting on it, so a `.test` file that
+exercises v2 grammar can still be dropped into an oracle run unchanged.
+
 ## Interface
 
 `compare_file(path, tinytable, sqlite3_module) -> list[Disagreement]` is
@@ -74,7 +86,7 @@ import sys
 from dataclasses import dataclass
 
 import run_sql_tests
-from run_sql_tests import QueryRecord, StatementRecord, _render
+from run_sql_tests import QueryRecord, RepeatRecord, StatementRecord, _render
 
 HERE = pathlib.Path(__file__).resolve().parent
 
@@ -107,8 +119,23 @@ def _grouped(flat: list[str], width: int) -> list[tuple]:
     return sorted(tuple(flat[i : i + width]) for i in range(0, len(flat), width))
 
 
+def _flatten_statement_and_query_records(records: list) -> list:
+    """Statement/query records in file order, recursing into `repeat`
+    bodies (still plain SQL, just looped - run once here since the oracle
+    checks correctness, not soak behavior) and skipping every other v2
+    record kind (session/step/permutation, lifecycle, advance_clock,
+    threshold, explain, assert-stats) - see this module's docstring."""
+    flat = []
+    for record in records:
+        if isinstance(record, (StatementRecord, QueryRecord)):
+            flat.append(record)
+        elif isinstance(record, RepeatRecord):
+            flat.extend(_flatten_statement_and_query_records(record.body))
+    return flat
+
+
 def compare_file(path: pathlib.Path, tinytable) -> list[Disagreement]:
-    records = run_sql_tests.parse_test_file(path)
+    records = _flatten_statement_and_query_records(run_sql_tests.parse_test_file(path))
     db = tinytable.Database()
     con = sqlite3.connect(":memory:")
     con.isolation_level = None  # autocommit: SAVEPOINT/RELEASE/ROLLBACK TO are explicit SQL here, not a DB-API transaction

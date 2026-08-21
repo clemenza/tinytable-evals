@@ -1,0 +1,38 @@
+version 2
+
+# session / step / permutation - SPEC.md's "v2: session / step /
+# permutation" section. Two permutations of the same two steps, each
+# starting from the same baseline (issue #18's trivial single-threaded
+# executor: steps run strictly in the order a permutation lists them).
+
+statement ok
+CREATE TABLE t (x INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+session s1
+step s1a
+UPDATE t SET x = 2 WHERE x = 1
+
+session s2
+step s2a
+UPDATE t SET x = 3 WHERE x = 1
+
+# s1a runs first and claims the one row (x: 1 -> 2); by the time s2a runs
+# its own "WHERE x = 1" no longer matches anything, so it's a no-op.
+permutation s1a s2a
+
+query I nosort
+SELECT x FROM t
+----
+2
+
+# same steps, reversed order: now s2a claims the row first (x: 1 -> 3) and
+# s1a's "WHERE x = 1" is the one that no-ops.
+permutation s2a s1a
+
+query I nosort
+SELECT x FROM t
+----
+3

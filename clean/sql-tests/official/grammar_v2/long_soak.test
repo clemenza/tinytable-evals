@@ -1,0 +1,25 @@
+version 2
+
+# repeat / advance_clock / threshold - SPEC.md's "v2: long-soak" section.
+# `repeat` actually runs its body N times today; `advance_clock` and
+# `threshold` are grammar-only pending #20's virtual clock and #21's
+# Grader v2 stats plumbing, so run_sql_tests.py reports them as skipped.
+
+statement ok
+CREATE TABLE t (x INTEGER)
+
+repeat 20 {
+statement ok
+INSERT INTO t VALUES (1)
+
+statement ok
+DELETE FROM t WHERE x = 1
+}
+
+query I nosort
+SELECT x FROM t
+----
+
+advance_clock 10s
+
+threshold retry_count <= 3
