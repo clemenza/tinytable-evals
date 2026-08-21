@@ -3,7 +3,8 @@
 `tinytable` is a small, dependency-free, single-table SQL engine: it parses
 and executes a subset of SQL (`CREATE TABLE`/`INSERT`/`UPDATE`/`DELETE`/
 `SELECT` with `WHERE`/`ORDER BY`/`LIMIT`/`OFFSET`, `CREATE [UNIQUE] INDEX`,
-and `SAVEPOINT`/`ROLLBACK TO`/`RELEASE`/`COMMIT`) against an in-memory table.
+`NOT NULL`/`CHECK`/`FOREIGN KEY` constraints, and `SAVEPOINT`/`ROLLBACK
+TO`/`RELEASE`/`COMMIT`) against an in-memory table.
 
 This document is the **sole arbiter of correct behavior**. `clean/` is a
 reference implementation of everything below; a "defect" is any observable
@@ -41,10 +42,13 @@ trailing `;` is optional and ignored.
 statement   := create_table | create_index | insert | update | delete
              | select | savepoint | rollback | release | commit
 
-create_table := CREATE TABLE ident '(' column_def (',' column_def)* ')'
-column_def    := ident column_type
+create_table  := CREATE TABLE ident '(' table_element (',' table_element)* ')'
+table_element := column_def | table_constraint
+column_def    := ident column_type [NOT NULL]
 column_type   := INTEGER | REAL | TEXT | BOOLEAN
-create_index  := CREATE [UNIQUE] INDEX ident ON ident '(' ident ')'
+table_constraint := CHECK '(' condition ')'
+                   | FOREIGN KEY '(' ident ')' REFERENCES ident '(' ident ')'
+create_index  := CREATE [UNIQUE] INDEX ident ON ident '(' ident (',' ident)* ')'
 insert        := INSERT INTO ident ['(' ident (',' ident)* ')']
                  VALUES '(' value (',' value)* ')'
 update        := UPDATE ident SET ident '=' value (',' ident '=' value)*
@@ -381,6 +385,79 @@ INSERT INTO t VALUES (1, 2)
 INSERT INTO t VALUES (1, 2)      -- raises: already present
 ```
 
+## Constraints: `NOT NULL`, `CHECK`, `FOREIGN KEY`
+
+Three more `CREATE TABLE` constraints, checked on every `INSERT`/`UPDATE`
+that could violate them (and, for `FOREIGN KEY`'s referenced side, on
+`DELETE`/`UPDATE` too - see below):
+
+### `NOT NULL`
+
+A column def may end with `NOT NULL` (e.g. `CREATE TABLE t (email TEXT NOT
+NULL)`). An `INSERT` that leaves the column `NULL` - explicitly, or by
+omitting it from an explicit column list - raises, as does an `UPDATE`
+that would set it to `NULL`.
+
+```sql
+CREATE TABLE t (email TEXT NOT NULL)
+INSERT INTO t VALUES (NULL)          -- raises: declared NOT NULL
+INSERT INTO t (email) VALUES ('a')   -- fine
+UPDATE t SET email = NULL WHERE email = 'a'   -- raises: declared NOT NULL
+```
+
+### `CHECK (condition)`
+
+A table-level constraint using the same `condition` grammar as `WHERE`
+(comparisons combined with `AND`/`OR`/`NOT` - see "SQL Surface" above),
+evaluated against every row an `INSERT`/`UPDATE` would leave behind.
+**Three-valued, not two-valued**: a row is rejected only when `condition`
+evaluates to definitely `FALSE` - if it evaluates to `NULL`/unknown (e.g.
+because a compared column is `NULL`), the row is accepted, same as real
+SQL engines' `CHECK` semantics (`FALSE AND NULL` is `FALSE`, not
+`NULL` - `FALSE` still dominates an unknown operand).
+
+```sql
+CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a > 10 AND b > 10))
+INSERT INTO t VALUES (NULL, 20)   -- fine: unknown, not definitely false
+INSERT INTO t VALUES (20, 1)      -- raises: CHECK constraint failed (definitely false)
+INSERT INTO t VALUES (NULL, 1)    -- raises: FALSE AND NULL is FALSE
+```
+
+### `FOREIGN KEY (col) REFERENCES ref_table(ref_col)`
+
+Declares that `col`'s value (when non-`NULL` - a `NULL` foreign key value
+is always allowed, same "NULL is exempt" spirit as uniqueness) must equal
+some row's `ref_col` in `ref_table`. `ref_table` must already exist, and
+**`ref_col` must already have a `CREATE UNIQUE INDEX`** on it (checked
+immediately, at the referencing `CREATE TABLE`, not deferred) - without
+one, "equal to some row's `ref_col`" isn't even well-defined, since
+nothing stops `ref_col` from holding duplicates.
+
+```sql
+CREATE TABLE customers (id INTEGER)
+CREATE UNIQUE INDEX uq ON customers(id)
+CREATE TABLE orders (id INTEGER, customer_id INTEGER,
+                      FOREIGN KEY (customer_id) REFERENCES customers(id))
+INSERT INTO customers VALUES (1)
+INSERT INTO orders VALUES (100, 2)   -- raises: no matching customers.id
+INSERT INTO orders VALUES (100, 1)   -- fine
+INSERT INTO orders VALUES (101, NULL)   -- fine: NULL is exempt
+```
+
+Checked on both sides of the relationship:
+
+- **Referencing side** (`orders` above): every `INSERT`/`UPDATE` that sets
+  `col` to a non-`NULL` value re-validates it against `ref_table`.
+- **Referenced side** (`customers` above): a `DELETE`, or an `UPDATE` that
+  changes `ref_col`'s value, is rejected if any referencing row's `col`
+  still equals the value being removed - there is no `CASCADE`; this is
+  always `RESTRICT`-equivalent.
+
+```sql
+DELETE FROM customers WHERE id = 1   -- raises: still referenced by orders.customer_id
+UPDATE customers SET id = 9 WHERE id = 1   -- raises, same reason
+```
+
 ## `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` / `COMMIT`
 
 `SAVEPOINT name` snapshots **every table's entire state** - rows, every
@@ -442,6 +519,10 @@ SELECT COUNT(x) FROM t     -- 1: excludes it
 | `ROLLBACK TO`/`RELEASE` a name no table has | `no such savepoint` |
 | an `INSERT`/`UPDATE` value's type doesn't match its column's declared type | `declared <TYPE>` |
 | a `CREATE TABLE` column with no type, or an unrecognized type name | `expected a column type` |
+| an `INSERT`/`UPDATE` would leave a `NOT NULL` column `NULL` | `declared NOT NULL` |
+| an `INSERT`/`UPDATE` would leave a row for which some `CHECK` is definitely `FALSE` | `CHECK constraint failed` |
+| a `FOREIGN KEY`'s `ref_col` has no `UNIQUE INDEX` (checked at the referencing `CREATE TABLE`) | `requires a UNIQUE INDEX` |
+| a `FOREIGN KEY` value has no match, or removing/changing a referenced value would orphan one | `foreign key constraint` |
 | a syntax error, or an unsupported statement shape (JOIN, mixed aggregates, missing table, etc.) | (implementation-specific `SqlError` message - not scored on exact wording, only that an error is raised) |
 
 ## Test Script Format

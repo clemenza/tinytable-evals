@@ -112,6 +112,7 @@ def compare_file(path: pathlib.Path, tinytable) -> list[Disagreement]:
     db = tinytable.Database()
     con = sqlite3.connect(":memory:")
     con.isolation_level = None  # autocommit: SAVEPOINT/RELEASE/ROLLBACK TO are explicit SQL here, not a DB-API transaction
+    con.execute("PRAGMA foreign_keys = ON")  # off by default in sqlite3 - see SPEC.md's "Constraints" section
     disagreements: list[Disagreement] = []
 
     for record in records:

@@ -93,9 +93,30 @@ COLUMN_TYPES: dict[str, type] = {
 
 
 @dataclass
+class ColumnDef:
+    name: str
+    type: str
+    not_null: bool = False
+
+
+@dataclass
+class CheckConstraint:
+    condition: Any  # a condition-grammar node (Cmp/BetweenNode/InNode/NullCheck/BoolOp - see below)
+
+
+@dataclass
+class ForeignKey:
+    column: str
+    ref_table: str
+    ref_column: str
+
+
+@dataclass
 class CreateTable:
     table: str
-    columns: list[tuple[str, str]]  # (name, type) in declared order
+    columns: list[ColumnDef]  # in declared order
+    checks: list[CheckConstraint] = field(default_factory=list)
+    foreign_keys: list[ForeignKey] = field(default_factory=list)
 
 
 @dataclass
@@ -325,24 +346,61 @@ class Parser:
         self._eat_op(")")
         return cols
 
-    def _parse_column_defs(self) -> list[tuple[str, str]]:
+    def _parse_table_elements(self) -> tuple[list[ColumnDef], list[CheckConstraint], list[ForeignKey]]:
+        """The comma-separated body of CREATE TABLE's '(' ... ')': a mix of
+        column defs and table-level constraints (CHECK/FOREIGN KEY), in any
+        order - see SPEC.md's "Constraints" section.
+        """
         self._eat_op("(")
-        defs = [self._parse_column_def()]
-        while self._try_op(","):
-            defs.append(self._parse_column_def())
+        columns: list[ColumnDef] = []
+        checks: list[CheckConstraint] = []
+        foreign_keys: list[ForeignKey] = []
+        while True:
+            if self._at_keyword("CHECK"):
+                checks.append(self._parse_check_constraint())
+            elif self._at_keyword("FOREIGN"):
+                foreign_keys.append(self._parse_foreign_key())
+            else:
+                columns.append(self._parse_column_def())
+            if not self._try_op(","):
+                break
         self._eat_op(")")
-        return defs
+        return columns, checks, foreign_keys
 
-    def _parse_column_def(self) -> tuple[str, str]:
+    def _parse_column_def(self) -> ColumnDef:
         name = self._eat_ident()
         for type_name in COLUMN_TYPES:
             if self._try_keyword(type_name):
-                return (name, type_name)
+                not_null = False
+                if self._try_keyword("NOT"):
+                    self._eat_keyword("NULL")
+                    not_null = True
+                return ColumnDef(name=name, type=type_name, not_null=not_null)
         tok = self._peek()
         raise SqlError(
             f"expected a column type ({'/'.join(COLUMN_TYPES)}) after column {name!r}, "
             f"got {tok.kind} {tok.value!r} at position {tok.pos}"
         )
+
+    def _parse_check_constraint(self) -> CheckConstraint:
+        self._eat_keyword("CHECK")
+        self._eat_op("(")
+        condition = self._parse_or()
+        self._eat_op(")")
+        return CheckConstraint(condition=condition)
+
+    def _parse_foreign_key(self) -> ForeignKey:
+        self._eat_keyword("FOREIGN")
+        self._eat_keyword("KEY")
+        self._eat_op("(")
+        column = self._eat_ident()
+        self._eat_op(")")
+        self._eat_keyword("REFERENCES")
+        ref_table = self._eat_ident()
+        self._eat_op("(")
+        ref_column = self._eat_ident()
+        self._eat_op(")")
+        return ForeignKey(column=column, ref_table=ref_table, ref_column=ref_column)
 
     def _parse_create(self):
         self._eat_keyword("CREATE")
@@ -361,8 +419,8 @@ class Parser:
             return CreateIndex(table=table, columns=columns, unique=False)
         self._eat_keyword("TABLE")
         table = self._eat_ident()
-        columns = self._parse_column_defs()
-        return CreateTable(table=table, columns=columns)
+        columns, checks, foreign_keys = self._parse_table_elements()
+        return CreateTable(table=table, columns=columns, checks=checks, foreign_keys=foreign_keys)
 
     def _parse_insert(self):
         self._eat_keyword("INSERT")
@@ -637,6 +695,54 @@ def _build_predicate(node) -> core.Predicate:
 
 
 # ---------------------------------------------------------------------------
+# CHECK constraint evaluation (see "Constraints" in SPEC.md)
+# ---------------------------------------------------------------------------
+
+
+def _tristate(node, row: dict) -> Optional[bool]:
+    """Three-valued (True/False/None-for-unknown) evaluation of a condition
+    node against `row`, for CHECK constraints - unlike _build_predicate's
+    core.Predicate.matches(), which collapses "unknown" into a WHERE-clause
+    non-match (correct for filtering, but wrong for CHECK: SPEC.md's
+    "Constraints" section requires a CHECK to reject a row only when it is
+    definitely False - NULL/unknown must pass, same as sqlite3's own CHECK
+    semantics - so AND/OR here follow real three-valued logic, e.g. `False
+    AND NULL` is `False` even though one operand is unknown).
+    """
+    if isinstance(node, Cmp):
+        v = row.get(node.column)
+        if v is None or node.value is None:
+            return None
+        return core._COMPARISON_OPS[node.op](v, node.value)
+    if isinstance(node, BetweenNode):
+        v = row.get(node.column)
+        if v is None or node.lo is None or node.hi is None:
+            return None
+        return node.lo <= v <= node.hi
+    if isinstance(node, InNode):
+        v = row.get(node.column)
+        if v is None:
+            return None
+        return v in node.values
+    if isinstance(node, NullCheck):
+        is_null = row.get(node.column) is None
+        return (not is_null) if node.negated else is_null
+    if isinstance(node, BoolOp):
+        if node.op == "not":
+            inner = _tristate(node.parts[0], row)
+            return None if inner is None else (not inner)
+        results = [_tristate(p, row) for p in node.parts]
+        if node.op == "and":
+            if any(r is False for r in results):
+                return False
+            return None if any(r is None for r in results) else True
+        if any(r is True for r in results):
+            return True
+        return None if any(r is None for r in results) else False
+    raise SqlError(f"unrecognized condition node: {node!r}")
+
+
+# ---------------------------------------------------------------------------
 # SELECT-item expression evaluation (see "Expressions in SELECT" in SPEC.md)
 # ---------------------------------------------------------------------------
 
@@ -742,6 +848,9 @@ class Database:
         self._tables: dict[str, core.Table] = {}
         self._schemas: dict[str, list[str]] = {}
         self._column_types: dict[str, dict[str, str]] = {}
+        self._not_null: dict[str, set] = {}
+        self._checks: dict[str, list[CheckConstraint]] = {}
+        self._foreign_keys: dict[str, list[ForeignKey]] = {}
 
     def _check_types(self, table: str, values: dict) -> None:
         types = self._column_types.get(table, {})
@@ -754,6 +863,49 @@ class Database:
                 raise SqlError(
                     f"column {column!r} of table {table!r} is declared {type_name} "
                     f"but got a {type(value).__name__} value: {value!r}"
+                )
+
+    def _check_not_null(self, table: str, row: dict) -> None:
+        for column in self._not_null.get(table, ()):
+            if row.get(column) is None:
+                raise SqlError(f"column {column!r} of table {table!r} is declared NOT NULL but got NULL")
+
+    def _check_check_constraints(self, table: str, row: dict) -> None:
+        for check in self._checks.get(table, ()):
+            if _tristate(check.condition, row) is False:
+                raise SqlError(f"CHECK constraint failed on table {table!r}")
+
+    def _check_foreign_keys_out(self, table: str, row: dict) -> None:
+        """Validate `table`'s own FOREIGN KEY columns in `row` (the
+        referencing side - INSERT/UPDATE into `table` itself).
+        """
+        for fk in self._foreign_keys.get(table, ()):
+            value = row.get(fk.column)
+            if value is None:
+                continue
+            if not self.table(fk.ref_table).select(core.eq(fk.ref_column, value)).count():
+                raise SqlError(
+                    f"foreign key constraint violated: {table}.{fk.column} = {value!r} has no "
+                    f"matching {fk.ref_table}.{fk.ref_column}"
+                )
+
+    def _incoming_foreign_keys(self, table: str) -> list:
+        """(referencing_table_name, ForeignKey) pairs whose ref_table is
+        `table` - the referenced side, checked before DELETE/UPDATE on
+        `table` itself removes or changes a value another table points to.
+        """
+        return [(t, fk) for t, fks in self._foreign_keys.items() for fk in fks if fk.ref_table == table]
+
+    def _check_no_incoming_references(self, table: str, column: str, value: Any) -> None:
+        if value is None:
+            return
+        for referencing_table, fk in self._incoming_foreign_keys(table):
+            if fk.ref_column != column:
+                continue
+            if self.table(referencing_table).select(core.eq(fk.column, value)).count():
+                raise SqlError(
+                    f"foreign key constraint violated: {table}.{column} = {value!r} is still "
+                    f"referenced by {referencing_table}.{fk.column}"
                 )
 
     def table(self, name: str) -> core.Table:
@@ -777,9 +929,19 @@ class Database:
         if isinstance(stmt, CreateTable):
             if stmt.table in self._tables:
                 raise SqlError(f"table {stmt.table!r} already exists")
+            for fk in stmt.foreign_keys:
+                ref_table = self.table(fk.ref_table)  # raises "no such table" if it doesn't exist yet
+                if fk.ref_column not in ref_table._unique:
+                    raise SqlError(
+                        f"FOREIGN KEY ({fk.column}) REFERENCES {fk.ref_table}({fk.ref_column}) requires a "
+                        f"UNIQUE INDEX on {fk.ref_table}.{fk.ref_column} (see SPEC.md's Constraints section)"
+                    )
             self._tables[stmt.table] = core.Table(stmt.table)
-            self._schemas[stmt.table] = [name for name, _ in stmt.columns]
-            self._column_types[stmt.table] = dict(stmt.columns)
+            self._schemas[stmt.table] = [c.name for c in stmt.columns]
+            self._column_types[stmt.table] = {c.name: c.type for c in stmt.columns}
+            self._not_null[stmt.table] = {c.name for c in stmt.columns if c.not_null}
+            self._checks[stmt.table] = stmt.checks
+            self._foreign_keys[stmt.table] = stmt.foreign_keys
             return None
         if isinstance(stmt, CreateIndex):
             table = self.table(stmt.table)
@@ -802,6 +964,9 @@ class Database:
                 raise SqlError(f"column count {len(columns)} does not match value count {len(stmt.values)}")
             row = dict(zip(columns, stmt.values))
             self._check_types(stmt.table, row)
+            self._check_not_null(stmt.table, row)
+            self._check_check_constraints(stmt.table, row)
+            self._check_foreign_keys_out(stmt.table, row)
             table.insert(row)
             return None
         if isinstance(stmt, Update):
@@ -809,11 +974,36 @@ class Database:
             predicate = _build_predicate(stmt.where) if stmt.where is not None else _AllPredicate()
             changes = dict(stmt.assignments)
             self._check_types(stmt.table, changes)
+            # NOT NULL/CHECK/FOREIGN KEY need each matched row's *merged*
+            # (existing + changes) state, not just `changes` in isolation -
+            # e.g. a CHECK referencing both a touched and an untouched
+            # column. Fetched read-only, before table.update() applies
+            # anything, so a rejected row leaves the table untouched.
+            if self._not_null.get(stmt.table) or self._checks.get(stmt.table) or self._foreign_keys.get(stmt.table):
+                for row in table.where(predicate).all():
+                    new_row = {**row, **changes}
+                    self._check_not_null(stmt.table, new_row)
+                    self._check_check_constraints(stmt.table, new_row)
+                    self._check_foreign_keys_out(stmt.table, new_row)
+            incoming = self._incoming_foreign_keys(stmt.table)
+            changed_ref_columns = {fk.ref_column for _, fk in incoming} & set(changes.keys())
+            if changed_ref_columns:
+                for row in table.where(predicate).all():
+                    for column in changed_ref_columns:
+                        old_value = row.get(column)
+                        if changes.get(column, old_value) != old_value:
+                            self._check_no_incoming_references(stmt.table, column, old_value)
             table.update(predicate, changes)
             return None
         if isinstance(stmt, Delete):
             table = self.table(stmt.table)
             predicate = _build_predicate(stmt.where) if stmt.where is not None else _AllPredicate()
+            incoming = self._incoming_foreign_keys(stmt.table)
+            if incoming:
+                ref_columns = {fk.ref_column for _, fk in incoming}
+                for row in table.where(predicate).all():
+                    for column in ref_columns:
+                        self._check_no_incoming_references(stmt.table, column, row.get(column))
             table.delete(predicate)
             return None
         if isinstance(stmt, Select):
