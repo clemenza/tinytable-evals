@@ -913,6 +913,23 @@ class Database:
             raise SqlError(f"no such table: {name}")
         return self._tables[name]
 
+    def stats(self) -> dict[str, int]:
+        """Whole-database counters - SPEC.md's "assert stats" (issue #18's
+        grammar), unblocked by issue #21's Grader v2 work. Every value is
+        a plain, deterministic function of current state; nothing here
+        reads a clock or any other nondeterministic source. Available
+        stat names: `table_count`, `row_count`, `index_count`,
+        `unique_index_count`, `open_savepoint_count` (each a total across
+        every table).
+        """
+        return {
+            "table_count": len(self._tables),
+            "row_count": sum(len(t) for t in self._tables.values()),
+            "index_count": sum(len(t._indexes) + len(t._composite_indexes) for t in self._tables.values()),
+            "unique_index_count": sum(len(t._unique) + len(t._composite_unique) for t in self._tables.values()),
+            "open_savepoint_count": sum(len(t._savepoints) for t in self._tables.values()),
+        }
+
     def _for_each_table_with_savepoint(self, name: str, action) -> None:
         matching = [t for t in self._tables.values() if name in t._savepoints]
         if not matching:

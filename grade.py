@@ -19,20 +19,32 @@ this file's own colocated run_sql_tests.py - never whatever copy, if any,
 happens to sit inside `--artifacts` - so an agent can't influence scoring
 by touching the runner.
 
-Steps:
-  1. Run run_sql_tests.py against `--artifacts`'s sql-tests/agent/ ->
-     failing set F_mutant (one entry per failing record: "<path>:<line>").
+Steps (issue #21's "Grader v2" - probabilistic over --runs, default 1,
+which degenerates to exactly the original single-run behavior):
+  1. For each of --runs seeds (0, 1, ..., runs-1): run run_sql_tests.py
+     --sim-seed <seed> against `--artifacts`'s sql-tests/agent/ ->
+     failing set F_mutant (one entry per failing record: "<path>:<line>"),
+     each tagged with the "[record_kind]" run_sql_tests.py's own output
+     prefixes every failure with.
   2. Copy `--artifacts`'s sql-tests/ (sql-tests/agent/ + sql-tests/official/)
      onto a temp copy of this repo's own clean/ reference engine, run the
-     same command -> F_clean.
-  3. killed = bool(F_mutant - F_clean); false_alarms = len(F_clean);
-     contract_ok = sql-tests/agent/ has at least one *.test file AND
+     same command (same seed) -> F_clean.
+  3. killed_tests = F_mutant - F_clean for that seed; kill_rate = (seeds
+     with a nonempty killed_tests) / runs; killed = kill_rate >=
+     --kill-rate-threshold (default 1.0 - runs=1 makes this exactly
+     "killed on the one run", the original behavior). false_alarms = the
+     total F_clean count across every seed - i.e. zero iff *every* seed's
+     clean run had zero failures ("false alarm defined as zero failures
+     over N runs on clean" - #21). Each killed test is also classified
+     "invariant" (an assert_stats or --check-admissibility violation) vs
+     plain "assertion" into killed_by_kind.
+  4. contract_ok = sql-tests/agent/ has at least one *.test file AND
      findings.json exists and validates against findings.schema.json AND
      `git status` in --artifacts shows tinytable/ and sql-tests/official/
      untouched.
-  4. Write score.json under --artifacts (or --out) and print
+  5. Write score.json under --artifacts (or --out) and print
      `SCORE_JSON: {...}` to stdout for a driver to parse.
-  5. Exit 0 iff killed and false_alarms == 0 and contract_ok, else 1.
+  6. Exit 0 iff killed and false_alarms == 0 and contract_ok, else 1.
 
 stdlib only (run_sql_tests.py, invoked as a subprocess, is itself stdlib -
 no pytest, no third-party imports anywhere in this pipeline). Each
@@ -64,7 +76,13 @@ _FINDING_FIELDS = ("id", "summary", "spec_section", "repro_test")
 _REPRO_TEST_RE = re.compile(r"^sql-tests/agent/.+\.test(:[0-9]+)?$")
 
 _FAIL_HEADER_RE = re.compile(r"^FAIL (?P<path>\S.*?) \((?P<detail>.+)\)$")
-_FAIL_LINE_RE = re.compile(r"^  line (?P<line>\d+): ")
+_FAIL_LINE_RE = re.compile(r"^  line (?P<line>\d+): (?:\[(?P<kind>[a-z_]+)\] )?")
+
+# run_sql_tests.py's record_kind tags (#21) that represent an "invariant"
+# violation (assert stats, --check-admissibility) rather than an ordinary
+# statement/query/step assertion - see grade.py's own module docstring
+# and run_sql_tests.py's docstring for the full tag list.
+_INVARIANT_KINDS = ("assert_stats", "admissibility")
 
 
 # ---------------------------------------------------------------------------
@@ -79,15 +97,17 @@ def _agent_tests_nonempty(root: pathlib.Path) -> bool:
     return any(agent_dir.rglob("*.test"))
 
 
-def _parse_failing_ids(output: str) -> set[str]:
-    """Parse run_sql_tests.py's stdout into a set of "<path>:<line>"
-    failing-record identifiers (":0" for a whole file that failed to parse -
-    see the "malformed test file" case in run_sql_tests.py's own output).
+def _parse_failing_ids(output: str) -> tuple[set[str], dict[str, str]]:
+    """Parse run_sql_tests.py's stdout into (failing_ids, kind_by_id).
+    `failing_ids` is a set of "<path>:<line>" failing-record identifiers
+    (":0" for a whole file that failed to parse - see the "malformed test
+    file" case in run_sql_tests.py's own output, which has no kind tag).
     `path` is exactly the token run_sql_tests.py printed, which - since we
     always invoke it with a path relative to `root` while cwd=root - is
     already relative and directly comparable between two different roots.
     """
     failing: set[str] = set()
+    kind_by_id: dict[str, str] = {}
     current: Optional[str] = None
     for line in output.splitlines():
         header = _FAIL_HEADER_RE.match(line)
@@ -98,30 +118,44 @@ def _parse_failing_ids(output: str) -> set[str]:
             continue
         record = _FAIL_LINE_RE.match(line)
         if record and current is not None:
-            failing.add(f"{current}:{record.group('line')}")
-    return failing
+            test_id = f"{current}:{record.group('line')}"
+            failing.add(test_id)
+            if record.group("kind"):
+                kind_by_id[test_id] = record.group("kind")
+    return failing, kind_by_id
 
 
-def _run_sql_tests(root: pathlib.Path, subdir: str, timeout: int) -> tuple[Optional[set[str]], str]:
-    """Run run_sql_tests.py --root `root` `subdir` (cwd=root, so `subdir`
-    stays relative in the output). Returns (failing_set, log); failing_set
-    is None iff the runner itself failed to run to completion (timeout, or
-    a crash) - the caller must treat that as an unscorable error, not "zero
+def _classify_kind(kind: Optional[str]) -> str:
+    return "invariant" if kind in _INVARIANT_KINDS else "assertion"
+
+
+def _run_sql_tests(
+    root: pathlib.Path, subdir: str, timeout: int, sim_seed: int = 0, check_admissibility: bool = False,
+) -> tuple[Optional[set[str]], dict[str, str], str]:
+    """Run run_sql_tests.py --root `root` --sim-seed `sim_seed` [--check-
+    admissibility] `subdir` (cwd=root, so `subdir` stays relative in the
+    output). Returns (failing_set, kind_by_id, log); failing_set is None
+    iff the runner itself failed to run to completion (timeout, or a
+    crash) - the caller must treat that as an unscorable error, not "zero
     failures".
     """
     target_dir = root / subdir
     if not target_dir.is_dir():
-        return set(), f"{subdir}/ does not exist - treating as zero tests, zero failures"
+        return set(), {}, f"{subdir}/ does not exist - treating as zero tests, zero failures"
 
-    cmd = [sys.executable, "-B", str(RUNNER), "--root", str(root), subdir]
+    cmd = [sys.executable, "-B", str(RUNNER), "--root", str(root), "--sim-seed", str(sim_seed)]
+    if check_admissibility:
+        cmd.append("--check-admissibility")
+    cmd.append(subdir)
     try:
         proc = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return None, f"run_sql_tests.py timed out after {timeout}s in {root}"
+        return None, {}, f"run_sql_tests.py timed out after {timeout}s in {root}"
     log = proc.stdout + proc.stderr
     if "Traceback (most recent call last):" in proc.stderr:
-        return None, f"run_sql_tests.py crashed in {root}:\n{log}"
-    return _parse_failing_ids(proc.stdout), log
+        return None, {}, f"run_sql_tests.py crashed in {root}:\n{log}"
+    failing, kind_by_id = _parse_failing_ids(proc.stdout)
+    return failing, kind_by_id, log
 
 
 # ---------------------------------------------------------------------------
@@ -216,45 +250,88 @@ def _check_contract(artifacts: pathlib.Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def grade(artifacts: pathlib.Path, clean: pathlib.Path, timeout: int) -> dict:
+def _tally_kinds(killed_tests: list[str], kind_by_id: dict[str, str]) -> dict[str, int]:
+    tally = {"assertion": 0, "invariant": 0}
+    for test_id in killed_tests:
+        tally[_classify_kind(kind_by_id.get(test_id))] += 1
+    return tally
+
+
+def grade(
+    artifacts: pathlib.Path,
+    clean: pathlib.Path,
+    timeout: int,
+    runs: int = 1,
+    kill_rate_threshold: float = 1.0,
+    check_admissibility: bool = False,
+) -> dict:
     contract_errors = _check_contract(artifacts)
     contract_ok = not contract_errors
 
     error: Optional[str] = None
+    per_run: list[dict] = []
 
-    f_mutant, mutant_log = _run_sql_tests(artifacts, "sql-tests/agent", timeout)
-    if f_mutant is None:
-        error = mutant_log
-        f_mutant = set()
-
-    f_clean: set[str] = set()
     with tempfile.TemporaryDirectory(prefix="tinytable-evals-clean-") as tmp:
         tmp_clean = pathlib.Path(tmp) / "clean"
         shutil.copytree(clean, tmp_clean)
         artifacts_sql_tests = artifacts / "sql-tests"
         if artifacts_sql_tests.is_dir():
             shutil.copytree(artifacts_sql_tests, tmp_clean / "sql-tests", dirs_exist_ok=True)
-        f_clean_result, clean_log = _run_sql_tests(tmp_clean, "sql-tests/agent", timeout)
-        if f_clean_result is None:
-            error = f"{error}\n{clean_log}" if error else clean_log
-        else:
-            f_clean = f_clean_result
 
-    killed_tests = sorted(f_mutant - f_clean)
-    killed = bool(killed_tests)
-    false_alarms = len(f_clean)
+        for seed in range(runs):
+            f_mutant, kinds_mutant, mutant_log = _run_sql_tests(
+                artifacts, "sql-tests/agent", timeout, sim_seed=seed, check_admissibility=check_admissibility
+            )
+            if f_mutant is None:
+                error = f"{error}\n{mutant_log}" if error else mutant_log
+                f_mutant = set()
+
+            f_clean, _kinds_clean, clean_log = _run_sql_tests(
+                tmp_clean, "sql-tests/agent", timeout, sim_seed=seed, check_admissibility=check_admissibility
+            )
+            if f_clean is None:
+                error = f"{error}\n{clean_log}" if error else clean_log
+                f_clean = set()
+
+            killed_tests = sorted(f_mutant - f_clean)
+            per_run.append(
+                {
+                    "seed": seed,
+                    "killed": bool(killed_tests),
+                    "killed_tests": killed_tests,
+                    "killed_by_kind": _tally_kinds(killed_tests, kinds_mutant),
+                    "false_alarms": len(f_clean),
+                    "f_mutant": sorted(f_mutant),
+                    "f_clean": sorted(f_clean),
+                }
+            )
+
+    kill_count = sum(1 for r in per_run if r["killed"])
+    kill_rate = kill_count / runs if runs else 0.0
+    killed = kill_rate >= kill_rate_threshold
+    false_alarms = sum(r["false_alarms"] for r in per_run)
+    killed_tests = sorted({t for r in per_run for t in r["killed_tests"]})
+    killed_by_kind = {"assertion": 0, "invariant": 0}
+    for r in per_run:
+        for k, v in r["killed_by_kind"].items():
+            killed_by_kind[k] += v
     passed = killed and false_alarms == 0 and contract_ok and error is None
 
     return {
         "artifacts": str(artifacts),
         "clean": str(clean),
+        "runs": runs,
+        "kill_rate": kill_rate,
+        "kill_rate_threshold": kill_rate_threshold,
         "killed": killed,
         "killed_tests": killed_tests,
+        "killed_by_kind": killed_by_kind,
         "false_alarms": false_alarms,
         "contract_ok": contract_ok,
         "contract_errors": contract_errors,
-        "f_mutant": sorted(f_mutant),
-        "f_clean": sorted(f_clean),
+        "f_mutant": sorted({t for r in per_run for t in r["f_mutant"]}),
+        "f_clean": sorted({t for r in per_run for t in r["f_clean"]}),
+        "per_run": per_run,
         "error": error,
         "passed": passed,
     }
@@ -266,6 +343,20 @@ def main() -> int:
     parser.add_argument("--clean", default=str(CLEAN), help="SPEC-compliant reference tinytable root (default: this repo's own clean/)")
     parser.add_argument("--out", default="score.json", help="output filename, written under --artifacts unless absolute (default: score.json)")
     parser.add_argument("--timeout", type=int, default=120, help="per-run_sql_tests.py-invocation timeout in seconds (default: 120)")
+    parser.add_argument(
+        "--runs", type=int, default=1,
+        help="run scoring this many times, seeds 0..runs-1 (#21's probabilistic-kill strategy for "
+        "nondeterministic bugs); default 1 is the original single-run behavior",
+    )
+    parser.add_argument(
+        "--kill-rate-threshold", type=float, default=1.0,
+        help="killed iff (seeds that killed) / --runs >= this (default: 1.0, i.e. every run must kill - "
+        "with --runs 1 this is exactly the original all-or-nothing behavior)",
+    )
+    parser.add_argument(
+        "--check-admissibility", action="store_true",
+        help="pass --check-admissibility through to every run_sql_tests.py invocation (#21); off by default",
+    )
     args = parser.parse_args()
 
     artifacts = pathlib.Path(args.artifacts).resolve()
@@ -274,8 +365,13 @@ def main() -> int:
         parser.error(f"--artifacts {artifacts} is not a directory")
     if not (clean / "tinytable").is_dir():
         parser.error(f"--clean {clean} has no tinytable/ package")
+    if args.runs < 1:
+        parser.error(f"--runs must be >= 1, got {args.runs}")
 
-    result = grade(artifacts, clean, args.timeout)
+    result = grade(
+        artifacts, clean, args.timeout,
+        runs=args.runs, kill_rate_threshold=args.kill_rate_threshold, check_admissibility=args.check_admissibility,
+    )
 
     out_path = pathlib.Path(args.out)
     if not out_path.is_absolute():

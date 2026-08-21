@@ -28,6 +28,13 @@ two CLIs (build_seed_root.py, grade.py). Verifies:
       I/O point deterministically for a fixed seed, discards only
       unfsync'd data on a plain crash, and its virtual clock advances
       correctly - all with no real filesystem or wall-clock touched.
+  (i) Grader v2 (issue #21): Database.stats() reports correct counters;
+      admissibility.py's conflict-serializability checker flags a
+      write-skew-shaped history and accepts a session-serial one, both
+      standalone and through run_sql_tests.py --check-admissibility;
+      grade.py classifies a killed record's assert_stats/admissibility
+      tag as "invariant" (else "assertion") and its --runs probabilistic
+      mode reports the shape it's supposed to.
 
 Deliberately does NOT check that any specific test can detect any specific
 operator's defect - doing so would mean writing a golden/answer test into
@@ -51,6 +58,8 @@ import subprocess
 import sys
 import tempfile
 
+import admissibility
+import grade
 import mutate
 import scheduler
 import substrate
@@ -213,6 +222,156 @@ def check_substrate_is_deterministic() -> None:
         fail(f"substrate.py: expected VirtualClock.now() == 10.5 after advancing 10s then 500ms, got {clock.now()}")
 
 
+def check_database_stats() -> None:
+    sys.path.insert(0, str(CLEAN))
+    import tinytable as clean_tinytable  # local import: must happen after sys.path is set up
+
+    db = clean_tinytable.Database()
+    db.execute("CREATE TABLE t (x INTEGER)")
+    db.execute("INSERT INTO t VALUES (1)")
+    db.execute("INSERT INTO t VALUES (2)")
+    db.execute("CREATE INDEX idx ON t(x)")
+    db.execute("SAVEPOINT s1")
+
+    stats = db.stats()
+    expected = {"table_count": 1, "row_count": 2, "index_count": 1, "unique_index_count": 0, "open_savepoint_count": 1}
+    if stats == expected:
+        ok("Database.stats() (#21) reports correct table/row/index/savepoint counts")
+    else:
+        fail(f"Database.stats() expected {expected}, got {stats}")
+
+
+def check_admissibility_detects_violations() -> None:
+    """#21's history-admissibility check, verified directly: a write-
+    skew-shaped history (two sessions, each reading one table and writing
+    the other, interleaved so their accesses cross) is correctly flagged
+    non-serializable; a session-serial history is correctly accepted.
+    """
+    write_skew = [
+        admissibility.Access(session="A", step="a1", kind="read", table="t1"),
+        admissibility.Access(session="B", step="b1", kind="read", table="t2"),
+        admissibility.Access(session="A", step="a2", kind="write", table="t2"),
+        admissibility.Access(session="B", step="b2", kind="write", table="t1"),
+    ]
+    admissible, cycle = admissibility.is_serializable(write_skew)
+    if admissible or not cycle:
+        fail(f"admissibility.py: a write-skew-shaped history should be flagged non-serializable, got admissible={admissible} cycle={cycle}")
+    else:
+        ok(f"admissibility.py: write-skew-shaped history correctly flagged non-serializable (witnessing cycle: {' -> '.join(cycle)})")
+
+    session_serial = [
+        admissibility.Access(session="A", step="a1", kind="write", table="t1"),
+        admissibility.Access(session="A", step="a2", kind="write", table="t2"),
+        admissibility.Access(session="B", step="b1", kind="write", table="t1"),
+        admissibility.Access(session="B", step="b2", kind="write", table="t2"),
+    ]
+    admissible2, cycle2 = admissibility.is_serializable(session_serial)
+    if not admissible2:
+        fail(f"admissibility.py: a session-serial history should be admissible, got cycle={cycle2}")
+    else:
+        ok("admissibility.py: a session-serial history (one session fully, then the other) is correctly accepted")
+
+
+def check_run_sql_tests_admissibility_flag(tmp: pathlib.Path) -> None:
+    """The same write-skew pattern as check_admissibility_detects_violations,
+    but through the actual .test grammar and run_sql_tests.py CLI: off by
+    default (unaffected), caught with --check-admissibility. A scratch
+    file outside clean/sql-tests/official/, so this never risks the
+    official suite's own "passes on clean" check.
+    """
+    scratch = tmp / "admissibility-check"
+    scratch.mkdir(parents=True, exist_ok=True)
+    (scratch / "writeskew.test").write_text(
+        "version 2\n\n"
+        "statement ok\nCREATE TABLE t1 (x INTEGER)\n\n"
+        "statement ok\nCREATE TABLE t2 (x INTEGER)\n\n"
+        "statement ok\nINSERT INTO t1 VALUES (1)\n\n"
+        "statement ok\nINSERT INTO t2 VALUES (1)\n\n"
+        "session a\nstep a_read\nSELECT x FROM t1\n\n"
+        "step a_write\nUPDATE t2 SET x = 2 WHERE x = 1\n\n"
+        "session b\nstep b_read\nSELECT x FROM t2\n\n"
+        "step b_write\nUPDATE t1 SET x = 2 WHERE x = 1\n\n"
+        "permutation a_read b_read a_write b_write\n"
+    )
+    without_flag, _ = run_suite(CLEAN, scratch)
+    with_flag = subprocess.run(
+        [sys.executable, "-B", str(RUNNER), "--root", str(CLEAN), "--check-admissibility", str(scratch)],
+        capture_output=True, text=True,
+    )
+    if without_flag and with_flag.returncode != 0 and "[admissibility]" in with_flag.stdout:
+        ok("run_sql_tests.py --check-admissibility: off by default, catches a write-skew permutation when enabled")
+    else:
+        fail(
+            f"run_sql_tests.py --check-admissibility: expected pass without the flag and an [admissibility] "
+            f"failure with it; got without_flag={without_flag}, with_flag.returncode={with_flag.returncode}, "
+            f"with_flag.stdout={with_flag.stdout!r}"
+        )
+
+
+def check_grade_kind_classification() -> None:
+    """grade.py's own [record_kind]-tag parsing/classification (#21),
+    checked directly against hand-built run_sql_tests.py-shaped output -
+    no need for an actual kill, which would depend on which operator a
+    generic seed happens to pick.
+    """
+    sample_output = (
+        "FAIL sql-tests/agent/x.test (2 failure(s))\n"
+        "  line 5: [statement] expected to succeed but raised SqlError: boom\n"
+        "  line 9: [assert_stats] assert stats row_count <= 0: actual=1\n"
+        "ok   sql-tests/agent/y.test\n"
+    )
+    failing, kinds = grade._parse_failing_ids(sample_output)
+    expected_ids = {"sql-tests/agent/x.test:5", "sql-tests/agent/x.test:9"}
+    expected_kinds = {"sql-tests/agent/x.test:5": "statement", "sql-tests/agent/x.test:9": "assert_stats"}
+    if failing != expected_ids or kinds != expected_kinds:
+        fail(f"grade.py: _parse_failing_ids gave ids={failing}, kinds={kinds}; expected ids={expected_ids}, kinds={expected_kinds}")
+        return
+    ok("grade.py: _parse_failing_ids extracts both failing ids and their [record_kind] tags")
+
+    tally = grade._tally_kinds(sorted(expected_ids), kinds)
+    if tally == {"assertion": 1, "invariant": 1}:
+        ok("grade.py: assert_stats/admissibility failures classify as 'invariant', everything else as 'assertion'")
+    else:
+        fail(f"grade.py: _tally_kinds classified {tally}, expected one assertion + one invariant")
+
+    if grade._classify_kind(None) != "assertion":
+        fail("grade.py: an untagged (e.g. malformed-file) failure should default to 'assertion'")
+    else:
+        ok("grade.py: an untagged failure defaults to 'assertion'")
+
+
+def check_grade_probabilistic_runs_end_to_end(tmp: pathlib.Path) -> None:
+    root = tmp / "e2e-grader-v2-seed-root"
+    proc = subprocess.run(
+        [sys.executable, str(BUILD_SEED_ROOT), "--seed", "5678", "--out", str(root)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        fail(f"build_seed_root.py failed (Grader v2 e2e): {proc.stdout}\n{proc.stderr}")
+        return
+
+    (root / "findings.json").write_text("[]")
+    (root / "sql-tests" / "agent" / "noop.test").write_text(
+        "statement ok\nCREATE TABLE t (x INTEGER)\n\nquery I nosort\nSELECT x FROM t\n----\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, str(GRADE), "--artifacts", str(root), "--out", "score.json", "--runs", "3"],
+        capture_output=True, text=True,
+    )
+    score = json.loads((root / "score.json").read_text())
+    if (
+        proc.returncode == 1
+        and score.get("contract_ok")
+        and not score.get("killed")
+        and score.get("runs") == 3
+        and score.get("kill_rate") == 0.0
+        and len(score.get("per_run", [])) == 3
+    ):
+        ok("grade.py --runs 3: a no-op test reports runs=3, kill_rate=0.0, killed=false, one per_run entry per seed")
+    else:
+        fail(f"grade.py --runs 3 against a no-op test: unexpected score {score}")
+
+
 def check_operators(tmp: pathlib.Path) -> None:
     for operator in mutate.OPERATORS:
         mutant_tt = tmp / operator.id / "tinytable"
@@ -334,11 +493,16 @@ def main() -> int:
     check_oracle_agrees_with_clean()
     check_scheduler_is_deterministic_and_usable_standalone()
     check_substrate_is_deterministic()
+    check_database_stats()
+    check_admissibility_detects_violations()
+    check_grade_kind_classification()
     check_selection_is_deterministic_and_covers_all_operators()
     with tempfile.TemporaryDirectory(prefix="tinytable-evals-selfcheck-") as td:
         tmp = pathlib.Path(td)
+        check_run_sql_tests_admissibility_flag(tmp)
         check_operators(tmp)
         check_build_seed_root_and_grade_end_to_end(tmp)
+        check_grade_probabilistic_runs_end_to_end(tmp)
 
     print()
     if _failures:
