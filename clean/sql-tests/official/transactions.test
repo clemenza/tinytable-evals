@@ -1,6 +1,5 @@
 # SAVEPOINT / ROLLBACK TO / RELEASE / COMMIT - see SPEC.md's transaction
-# section. No CREATE INDEX anywhere in this file - checking index contents
-# right after a rollback is the seeded defect (see golden/ once it exists).
+# section.
 
 statement ok
 CREATE TABLE t (x INTEGER)

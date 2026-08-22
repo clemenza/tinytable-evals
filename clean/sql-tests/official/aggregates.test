@@ -1,8 +1,6 @@
 # COUNT/MIN/MAX - see SPEC.md's Aggregates section.
-# Never calls COUNT(col) on a column that has a NULL value present - NULL
-# exclusion there is the seeded defect (see golden/ once it exists).
-# COUNT(*) is exercised against data that DOES include NULLs, since that's
-# unaffected by the defect (COUNT(*) must always include every row).
+# COUNT(*) is exercised against data that includes NULLs: COUNT(*) counts
+# every row regardless of column contents.
 
 statement ok
 CREATE TABLE people (name TEXT, age INTEGER, dept TEXT)
@@ -24,7 +22,7 @@ SELECT COUNT(*) FROM people
 ----
 4
 
-# `dept` is fully populated (no NULLs) - safe for COUNT(dept).
+# `dept` is fully populated (no NULLs), so COUNT(dept) counts every row.
 query I nosort
 SELECT COUNT(dept) FROM people
 ----
