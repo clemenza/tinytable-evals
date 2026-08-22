@@ -1,6 +1,4 @@
-# unique() - see SPEC.md's Table.unique section.
-# Never inserts two NULLs into the same unique() column in one file - that's
-# the seeded defect (see golden/ once it exists).
+# Uniqueness - see SPEC.md's Uniqueness section.
 
 statement ok
 CREATE TABLE people (email TEXT, n INTEGER)

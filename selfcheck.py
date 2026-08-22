@@ -35,6 +35,10 @@ two CLIs (build_seed_root.py, grade.py). Verifies:
       grade.py classifies a killed record's assert_stats/admissibility
       tag as "invariant" (else "assertion") and its --runs probabilistic
       mode reports the shape it's supposed to.
+  (j) issue #36: build_seed_root.py's scrub_check_official() catches
+      seeded-defect-revealing commentary and dangling sibling-.test
+      references before they'd ship in a seed-root's sql-tests/official/,
+      and a real seed-root built by build_seed_root.py today is clean.
 
 Deliberately does NOT check that any specific test can detect any specific
 operator's defect - doing so would mean writing a golden/answer test into
@@ -53,12 +57,14 @@ import difflib
 import json
 import pathlib
 import py_compile
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 
 import admissibility
+import build_seed_root
 import grade
 import mutate
 import scheduler
@@ -431,6 +437,68 @@ def check_selection_is_deterministic_and_covers_all_operators() -> None:
         ok("select_operator(seed) reaches every operator in the library over a large seed sample")
 
 
+def check_official_tests_dont_leak_seeded_defect_location(tmp: pathlib.Path) -> None:
+    """Issue #36: clean/sql-tests/official/ must never tell an exam-taking
+    agent which scenario is the seeded defect, and must never dangle a
+    reference to a sibling .test file that doesn't exist. Checks both
+    build_seed_root.py's own forbidden-pattern guard (against a deliberately
+    leaky fixture, so it's exercised even though clean/sql-tests/official/
+    is clean today) and a real seed-root's sql-tests/official/, end to end.
+    """
+    leaky = tmp / "scrub-check-leaky-official"
+    leaky.mkdir(parents=True)
+    (leaky / "leaky.test").write_text("# that's the seeded defect (see golden/ once it exists)\n")
+    try:
+        build_seed_root.scrub_check_official(leaky)
+        fail("build_seed_root.scrub_check_official() did not raise on a fixture with 'seeded defect' commentary")
+    except RuntimeError:
+        ok("build_seed_root.scrub_check_official() raises on seeded-defect-revealing commentary")
+
+    dangling = tmp / "scrub-check-dangling-official"
+    dangling.mkdir(parents=True)
+    (dangling / "a.test").write_text("# see b.test for that\n")
+    try:
+        build_seed_root.scrub_check_official(dangling)
+        fail("build_seed_root.scrub_check_official() did not raise on a dangling sibling-.test reference")
+    except RuntimeError:
+        ok("build_seed_root.scrub_check_official() raises on a reference to a missing sibling .test file")
+
+    grammar_seed = tmp / "scrub-check-grammar-seed"
+    grammar_seed.mkdir(parents=True)
+    (grammar_seed / "lifecycle.test").write_text("# genuinely executes against the file's own seeded substrate.Simulation\n")
+    try:
+        build_seed_root.scrub_check_official(grammar_seed)
+        ok("build_seed_root.scrub_check_official() does not false-positive on substrate.Simulation's RNG 'seeded'")
+    except RuntimeError as exc:
+        fail(f"build_seed_root.scrub_check_official() false-positived on an RNG-seed mention: {exc}")
+
+    root = tmp / "scrub-check-real-seed-root"
+    proc = subprocess.run(
+        [sys.executable, str(BUILD_SEED_ROOT), "--seed", "36", "--out", str(root)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        fail(f"build_seed_root.py failed (seeded-defect leak check): {proc.stdout}\n{proc.stderr}")
+        return
+
+    official = root / "sql-tests" / "official"
+    test_files = {path.name for path in official.rglob("*.test")}
+    offenders = []
+    for path in sorted(official.rglob("*.test")):
+        text = path.read_text()
+        rel = path.relative_to(official)
+        for pattern in build_seed_root.FORBIDDEN_OFFICIAL_PATTERNS:
+            if pattern.search(text):
+                offenders.append(f"{rel}: matches {pattern.pattern!r}")
+        for match in re.finditer(r"\b[\w-]+\.test\b", text):
+            if match.group(0) not in test_files:
+                offenders.append(f"{rel}: references missing sibling test file {match.group(0)!r}")
+    if offenders:
+        fail("a real seed-root's sql-tests/official/ leaks seeded-defect info or dangles a reference:\n" + "\n".join(offenders))
+    else:
+        ok("a real seed-root's sql-tests/official/ has no seeded-defect leaks or dangling sibling-.test references")
+
+
 def check_build_seed_root_and_grade_end_to_end(tmp: pathlib.Path) -> None:
     root = tmp / "e2e-seed-root"
     proc = subprocess.run(
@@ -503,6 +571,7 @@ def main() -> int:
         check_operators(tmp)
         check_build_seed_root_and_grade_end_to_end(tmp)
         check_grade_probabilistic_runs_end_to_end(tmp)
+        check_official_tests_dont_leak_seeded_defect_location(tmp)
 
     print()
     if _failures:

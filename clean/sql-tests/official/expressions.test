@@ -31,13 +31,9 @@ SELECT a / b FROM t
 ----
 2
 
-# Mixed-sign integer division (where truncate-toward-zero and floor
-# division disagree, e.g. -5 / 2) and division-by-zero-is-NULL are each
-# deliberately not pinned down anywhere in this file - those are seeded
-# defects (see golden/ once it exists), same convention as unique.test's
-# "never inserts two NULLs into the same unique() column" note. SPEC.md's
-# "Expressions in SELECT" section still documents and manually verifies
-# both rules with worked examples.
+# See SPEC.md's "Expressions in `SELECT`" section for the full arithmetic
+# contract, including mixed-sign integer division and division by zero,
+# with worked examples.
 
 # name: unary minus and parenthesized grouping
 query I nosort

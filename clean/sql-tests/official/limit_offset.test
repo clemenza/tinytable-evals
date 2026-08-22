@@ -1,6 +1,4 @@
-# LIMIT / OFFSET - see SPEC.md's limit/offset section.
-# Never combines LIMIT and OFFSET in the same query - their interaction
-# order is the seeded defect (see golden/ once it exists).
+# LIMIT / OFFSET - see SPEC.md's `LIMIT n` / `OFFSET n` section.
 
 statement ok
 CREATE TABLE t (x INTEGER)

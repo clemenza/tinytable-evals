@@ -1,11 +1,5 @@
-# create_index() - see SPEC.md's Table.create_index section: an index must
+# Secondary index - see SPEC.md's "Secondary index" section: an index must
 # agree with a full scan.
-#
-# This file avoids `ge` at a value that exactly equals an indexed row's
-# value (that boundary is the one seeded defect - see golden/ once it
-# exists). `ge(x, 0)` below is safe: 0 never equals any row's `x`, and a
-# bisect-based range scan only diverges between an inclusive/exclusive
-# boundary when the queried value is actually present in the data.
 
 statement ok
 CREATE TABLE people (name TEXT, dept TEXT, age INTEGER)
@@ -52,8 +46,8 @@ SELECT name FROM people WHERE age > 35
 ----
 Cy
 
-# between via an index, including exact boundary values, is unaffected by
-# the seeded `ge` defect (a separate code path - see SPEC.md).
+# BETWEEN via an index, including exact boundary values, agrees with a
+# full scan.
 query T rowsort
 SELECT name FROM people WHERE age BETWEEN 25 AND 35
 ----

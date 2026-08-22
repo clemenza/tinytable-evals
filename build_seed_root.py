@@ -10,7 +10,9 @@ repo's mutation operator library and applies it to a fresh copy of
 
     DIR/
       tinytable/               the mutated engine
-      sql-tests/official/      untouched copy of clean/sql-tests/official
+      sql-tests/official/      copy of clean/sql-tests/official, checked
+                                for seeded-defect leaks before the copy (see
+                                scrub_check_official, issue #36)
       sql-tests/agent/         empty - for the exam-taking agent to fill in
       SPEC.md
       task-prompt.md
@@ -43,6 +45,7 @@ import argparse
 import datetime
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -52,14 +55,53 @@ import mutate
 HERE = pathlib.Path(__file__).resolve().parent
 CLEAN = HERE / "clean"
 
+# Patterns that would tell an exam-taking agent which scenario is the seeded
+# defect, or point it at a "golden" answer - see issue #36. None of these
+# have a legitimate reason to appear in clean/sql-tests/official/, which is
+# copied into every seed-root verbatim.
+FORBIDDEN_OFFICIAL_PATTERNS = [
+    re.compile(r"\bdefects?\b", re.IGNORECASE),
+    re.compile(r"\bgolden\b", re.IGNORECASE),
+    re.compile(r"\bavoids?\b", re.IGNORECASE),
+    re.compile(r"\bdeliberately\b", re.IGNORECASE),
+    re.compile(r"\bpinned down\b", re.IGNORECASE),
+]
+
 
 def _git(*args: str, cwd: pathlib.Path) -> None:
     subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True)
 
 
+def scrub_check_official(official: pathlib.Path) -> None:
+    """Raise loudly if any file under `official` leaks which scenario is
+    the seeded defect, or dangles a reference to a sibling .test file that
+    doesn't exist (issue #36). Called before every copy of
+    clean/sql-tests/official/ into a seed-root - a seed-root must never
+    ship this fixture's authors a hint about where the mutant hides."""
+    test_files = {path.name for path in official.rglob("*.test")}
+    offenders = []
+    for path in sorted(official.rglob("*.test")):
+        text = path.read_text()
+        rel = path.relative_to(official)
+        for pattern in FORBIDDEN_OFFICIAL_PATTERNS:
+            if pattern.search(text):
+                offenders.append(f"{rel}: matches forbidden pattern {pattern.pattern!r}")
+        for match in re.finditer(r"\b[\w-]+\.test\b", text):
+            if match.group(0) not in test_files:
+                offenders.append(f"{rel}: references missing sibling test file {match.group(0)!r}")
+    if offenders:
+        raise RuntimeError(
+            "clean/sql-tests/official/ leaks seeded-defect information or dangles a reference "
+            "to a nonexistent .test file - refusing to build a seed-root:\n" + "\n".join(offenders)
+        )
+
+
 def build_seed_root(seed: int, out: pathlib.Path) -> mutate.Operator:
     if out.exists():
         raise FileExistsError(f"--out {out} already exists")
+
+    scrub_check_official(CLEAN / "sql-tests" / "official")
+
     out.mkdir(parents=True)
 
     operator = mutate.select_operator(seed)

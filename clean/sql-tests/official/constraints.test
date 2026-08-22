@@ -12,10 +12,8 @@ statement ok
 INSERT INTO t VALUES ('a@x.com', 1)
 
 # name: NOT NULL on UPDATE
-# Setting a NOT NULL column to NULL via UPDATE is deliberately not pinned
-# down here - that's the seeded defect below (see golden/ once it exists),
-# same convention as unique.test's own NULL note. UPDATE leaving a NOT
-# NULL column with its own (already non-NULL) value is still exercised.
+# UPDATE leaving a NOT NULL column with its own (already non-NULL) value
+# is exercised here; see SPEC.md's `NOT NULL` section for the full rule.
 statement ok
 UPDATE t SET n = 2 WHERE email = 'a@x.com'
 
@@ -36,9 +34,9 @@ INSERT INTO u VALUES (NULL, 20)
 statement error CHECK constraint failed
 INSERT INTO u VALUES (20, 1)
 
-# `NULL AND FALSE` is `FALSE` (FALSE dominates an unknown operand) - not
-# pinned down here (seeded defect below, see golden/ once it exists);
-# SPEC.md's "Constraints" section documents and manually verifies it.
+# See SPEC.md's `CHECK (condition)` section for the full three-valued
+# CHECK truth table, including `NULL AND FALSE` (FALSE dominates an
+# unknown operand).
 
 query I nosort
 SELECT COUNT(*) FROM u
@@ -77,12 +75,9 @@ SELECT customer_id FROM orders
 1
 NULL
 
-# A referencing value with no match on INSERT/UPDATE, and removing/
-# changing a referenced value that's still in use, are each deliberately
-# not pinned down here (seeded defects below, see golden/ once it exists).
-# SPEC.md's "Constraints" section documents and manually verifies both.
-# DELETE/UPDATE on a referenced row that is NOT currently referenced still
-# works normally:
+# See SPEC.md's `FOREIGN KEY` section for the full referential-integrity
+# contract. DELETE/UPDATE on a referenced row that is NOT currently
+# referenced still works normally:
 statement ok
 DELETE FROM customers WHERE id = 2
 

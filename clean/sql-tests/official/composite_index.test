@@ -25,20 +25,13 @@ SELECT tag FROM t WHERE b = 1 AND a = 2
 ----
 r
 
-# A composite index must return the same rows an unindexed table would for
-# shapes it can't accelerate: a range comparison on one of its columns, or
-# a WHERE that doesn't pin every one of its columns with '=' (e.g. `a = 1`
-# alone, or `a = 1 AND b > 0`, against the `(a, b)` index above). Neither
-# scenario is pinned down here - that's the seeded defect below (see
-# golden/ once it exists), same convention as unique.test's NULL note.
-# SPEC.md's "Composite secondary index" section documents and manually
-# verifies both with worked examples.
+# A composite index must return the same rows an unindexed table would;
+# see SPEC.md's "Composite secondary index" section for the full contract,
+# with worked examples.
 
 # name: a single-column index may coexist on a column a composite index
 # also covers - building it must not disturb the composite index or the
-# rows (a WHERE naming only `a`, not `b`, is exactly the composite-index
-# partial-key seeded defect above, so it's deliberately not queried here -
-# see index.test for single-column range-scan coverage instead).
+# rows.
 statement ok
 CREATE INDEX idx_a ON t(a)
 
@@ -49,9 +42,8 @@ r
 
 # name: composite unique
 # A NULL in any one component exempts a row from the composite unique
-# constraint - not pinned down here (seeded defect below, see golden/ once
-# it exists; SPEC.md's "Composite uniqueness" section documents and
-# manually verifies it), same convention as unique.test's own NULL note.
+# constraint; see SPEC.md's "Composite uniqueness" section for the full
+# rule, with worked examples.
 statement ok
 CREATE TABLE u (a INTEGER, b INTEGER)
 

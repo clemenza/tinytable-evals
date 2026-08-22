@@ -1,7 +1,5 @@
-# ORDER BY - see SPEC.md's order_by section.
-# Uses only distinct sort-key values (never tests stability/duplicate keys),
-# and never combines NULLS LAST/FIRST with DESC in the same query - those
-# are the two seeded defects (see golden/ once it exists).
+# ORDER BY - see SPEC.md's `ORDER BY col [ASC|DESC] [NULLS FIRST|LAST]`
+# section.
 
 statement ok
 CREATE TABLE t (x INTEGER)
