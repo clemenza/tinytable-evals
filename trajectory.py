@@ -91,7 +91,22 @@ def git_diff(root: pathlib.Path, baseline_ref: str = "HEAD") -> tuple[str, list[
     Empty diff/list if `root` has no changes (or isn't a git repo - `git`
     itself reports that via a nonzero exit code, surfaced as an empty
     result rather than raising, since "no diff available" is a legitimate
-    outcome for a caller logging opportunistically)."""
+    outcome for a caller logging opportunistically).
+
+    `git diff <ref>` alone never mentions an untracked path - and every
+    `.test` file an agent adds under `sql-tests/agent/` starts out
+    untracked, since the seed-root's initial commit only has a
+    `.gitkeep` there (see build_seed_root.py) - so without the `git add
+    --intent-to-add` below, every agent-added test file would silently
+    vanish from both `diff` and `files_changed` instead of showing up as
+    an addition. `--intent-to-add` marks each untracked path with a
+    zero-content index entry first (stages no content, commits nothing)
+    so `git diff` reports it as a full addition; harmless for a later
+    `git status`-based check (e.g. grade.py's own protected-path check),
+    which reports an intent-to-add path the same way it reports a plain
+    untracked one.
+    """
+    subprocess.run(["git", "-C", str(root), "add", "--intent-to-add", "--all", "--", "."], capture_output=True, text=True)
     diff_proc = subprocess.run(["git", "-C", str(root), "diff", baseline_ref, "--"], capture_output=True, text=True)
     status_proc = subprocess.run(
         ["git", "-C", str(root), "diff", baseline_ref, "--name-status", "--"], capture_output=True, text=True
