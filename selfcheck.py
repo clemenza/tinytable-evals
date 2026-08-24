@@ -386,6 +386,53 @@ def check_grade_probabilistic_runs_end_to_end(tmp: pathlib.Path) -> None:
         fail(f"grade.py --runs 3 against a no-op test: unexpected score {score}")
 
 
+def check_grade_trajectory_log(tmp: pathlib.Path) -> None:
+    """#40's grade.py --trajectory-log: passed through to every step-1
+    (sql-tests/agent against --artifacts itself) run_sql_tests.py
+    invocation, one schema-valid test_run event per --runs seed - and
+    *not* leaked from step 2's clean-reference comparison runs (whose
+    root is a deleted temp directory), so exactly --runs events land in
+    --artifacts's own trajectory log, not 2x --runs."""
+    root = tmp / "e2e-grade-trajectory-log-seed-root"
+    proc = subprocess.run(
+        [sys.executable, str(BUILD_SEED_ROOT), "--seed", "9012", "--out", str(root)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        fail(f"build_seed_root.py failed (grade.py --trajectory-log e2e): {proc.stdout}\n{proc.stderr}")
+        return
+
+    (root / "findings.json").write_text("[]")
+    (root / "sql-tests" / "agent" / "noop.test").write_text(
+        "statement ok\nCREATE TABLE t (x INTEGER)\n\nquery I nosort\nSELECT x FROM t\n----\n"
+    )
+    subprocess.run(
+        [
+            sys.executable, str(GRADE), "--artifacts", str(root), "--out", "score.json",
+            "--runs", "3", "--trajectory-log", "trajectory.jsonl",
+        ],
+        capture_output=True, text=True,
+    )
+
+    log_path = root / "trajectory.jsonl"
+    if not log_path.is_file():
+        fail("grade.py --trajectory-log trajectory.jsonl: did not create trajectory.jsonl under --artifacts")
+        return
+    events = trajectory.read_events(log_path)
+    errors = [e for event in events for e in trajectory.validate_event(event)]
+    test_run_events = [event for event in events if event["kind"] == "test_run"]
+    if errors:
+        fail(f"grade.py --trajectory-log: emitted event(s) fail schema validation: {errors}")
+    elif len(events) != 3 or len(test_run_events) != 3:
+        fail(
+            f"grade.py --trajectory-log --runs 3: expected exactly 3 test_run events (one per grader seed, none "
+            f"leaked from the clean-reference comparison side), got {len(events)} event(s) "
+            f"({len(test_run_events)} test_run): {events}"
+        )
+    else:
+        ok("grade.py --trajectory-log --runs 3: exactly 3 schema-valid test_run events, none from the clean-reference side")
+
+
 def check_operators(tmp: pathlib.Path) -> None:
     for operator in mutate.OPERATORS:
         mutant_tt = tmp / operator.id / "tinytable"
@@ -636,6 +683,7 @@ def main() -> int:
         check_operators(tmp)
         check_build_seed_root_and_grade_end_to_end(tmp)
         check_grade_probabilistic_runs_end_to_end(tmp)
+        check_grade_trajectory_log(tmp)
         check_official_tests_dont_leak_seeded_defect_location(tmp)
 
     print()

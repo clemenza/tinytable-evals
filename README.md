@@ -202,6 +202,13 @@ any point during a trial. See `trajectory.py`'s module docstring for the
 full event schema and `trajectory_schema.json` for the same contract as a
 JSON Schema.
 
+`grade.py --trajectory-log PATH` (a driver's own scoring pass is a
+`run_sql_tests.py` invocation too) passes the flag through to every
+step-1 run against `--artifacts` itself - one `test_run` event per
+`--runs` seed - without leaking it into step 2's internal clean-reference
+comparison runs, whose root is a temp directory deleted before `grade.py`
+returns.
+
 `sample_trajectory.py` is a runnable demonstration: it builds a seed-root
 and drives a small scripted stand-in for an exam-taking agent through it
 (same "prove it mechanically, don't write down a golden answer" trade-off

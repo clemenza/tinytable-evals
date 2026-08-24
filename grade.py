@@ -2,7 +2,7 @@
 """grade: score a tinytable seed-root against task-prompt.md's output contract.
 
 Usage:
-    python3 grade.py --artifacts DIR [--out score.json] [--timeout 120]
+    python3 grade.py --artifacts DIR [--out score.json] [--timeout 120] [--trajectory-log trajectory.jsonl]
 
 `--artifacts` is a seed-root as produced by `build_seed_root.py`, plus
 whatever an exam-taking agent added under `sql-tests/agent/` and
@@ -50,6 +50,13 @@ stdlib only (run_sql_tests.py, invoked as a subprocess, is itself stdlib -
 no pytest, no third-party imports anywhere in this pipeline). Each
 run_sql_tests.py invocation is subprocess.run(..., timeout=...) so a
 runaway or looping test written by the agent can't hang scoring.
+
+`--trajectory-log PATH` (issue #40, opt-in, off by default) passes
+`--trajectory-log PATH` through to every step-1 run_sql_tests.py
+invocation (one `test_run` event per --runs seed, appended to PATH -
+relative to --artifacts unless absolute, same convention as --out). Not
+passed to step 2's clean-reference comparison runs - see _run_sql_tests's
+docstring for why relative wouldn't even reach a caller there.
 
 This is one of the two CLIs honeyrail's builder integrates against (the
 other is build_seed_root.py).
@@ -131,13 +138,15 @@ def _classify_kind(kind: Optional[str]) -> str:
 
 def _run_sql_tests(
     root: pathlib.Path, subdir: str, timeout: int, sim_seed: int = 0, check_admissibility: bool = False,
+    trajectory_log: Optional[str] = None,
 ) -> tuple[Optional[set[str]], dict[str, str], str]:
     """Run run_sql_tests.py --root `root` --sim-seed `sim_seed` [--check-
-    admissibility] `subdir` (cwd=root, so `subdir` stays relative in the
-    output). Returns (failing_set, kind_by_id, log); failing_set is None
-    iff the runner itself failed to run to completion (timeout, or a
-    crash) - the caller must treat that as an unscorable error, not "zero
-    failures".
+    admissibility] [--trajectory-log `trajectory_log`] `subdir` (cwd=root,
+    so `subdir` - and `trajectory_log`, when relative - stay relative to
+    `root` in the output). Returns (failing_set, kind_by_id, log);
+    failing_set is None iff the runner itself failed to run to completion
+    (timeout, or a crash) - the caller must treat that as an unscorable
+    error, not "zero failures".
     """
     target_dir = root / subdir
     if not target_dir.is_dir():
@@ -146,6 +155,8 @@ def _run_sql_tests(
     cmd = [sys.executable, "-B", str(RUNNER), "--root", str(root), "--sim-seed", str(sim_seed)]
     if check_admissibility:
         cmd.append("--check-admissibility")
+    if trajectory_log:
+        cmd.extend(["--trajectory-log", trajectory_log])
     cmd.append(subdir)
     try:
         proc = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, timeout=timeout)
@@ -264,6 +275,7 @@ def grade(
     runs: int = 1,
     kill_rate_threshold: float = 1.0,
     check_admissibility: bool = False,
+    trajectory_log: Optional[str] = None,
 ) -> dict:
     contract_errors = _check_contract(artifacts)
     contract_ok = not contract_errors
@@ -279,8 +291,16 @@ def grade(
             shutil.copytree(artifacts_sql_tests, tmp_clean / "sql-tests", dirs_exist_ok=True)
 
         for seed in range(runs):
+            # trajectory_log is passed only for the artifacts (agent/mutant)
+            # side: it's the trial's own telemetry (issue #40), and
+            # trajectory_log - when relative, as every caller so far uses -
+            # resolves against `root` (see _run_sql_tests's docstring), so
+            # passing it for the tmp_clean side would write into the
+            # TemporaryDirectory this `with` block deletes on exit, not
+            # anywhere a caller could read it back from.
             f_mutant, kinds_mutant, mutant_log = _run_sql_tests(
-                artifacts, "sql-tests/agent", timeout, sim_seed=seed, check_admissibility=check_admissibility
+                artifacts, "sql-tests/agent", timeout, sim_seed=seed, check_admissibility=check_admissibility,
+                trajectory_log=trajectory_log,
             )
             if f_mutant is None:
                 error = f"{error}\n{mutant_log}" if error else mutant_log
@@ -357,6 +377,13 @@ def main() -> int:
         "--check-admissibility", action="store_true",
         help="pass --check-admissibility through to every run_sql_tests.py invocation (#21); off by default",
     )
+    parser.add_argument(
+        "--trajectory-log", default=None,
+        help="pass --trajectory-log through to every sql-tests/agent run_sql_tests.py invocation against "
+        "--artifacts itself (issue #40) - one test_run event per --runs seed; relative to --artifacts unless "
+        "absolute, same convention as --out. Not passed to the internal clean-reference comparison runs (their "
+        "root is a temp directory deleted before this process exits). Off by default.",
+    )
     args = parser.parse_args()
 
     artifacts = pathlib.Path(args.artifacts).resolve()
@@ -371,6 +398,7 @@ def main() -> int:
     result = grade(
         artifacts, clean, args.timeout,
         runs=args.runs, kill_rate_threshold=args.kill_rate_threshold, check_admissibility=args.check_admissibility,
+        trajectory_log=args.trajectory_log,
     )
 
     out_path = pathlib.Path(args.out)
