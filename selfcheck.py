@@ -39,6 +39,12 @@ two CLIs (build_seed_root.py, grade.py). Verifies:
       seeded-defect-revealing commentary and dangling sibling-.test
       references before they'd ship in a seed-root's sql-tests/official/,
       and a real seed-root built by build_seed_root.py today is clean.
+  (k) issue #40: run_sql_tests.py --trajectory-log appends a schema-valid
+      test_run event; sample_trajectory.py's scripted stand-in trial
+      produces one trajectory.jsonl whose every line validates against
+      trajectory.validate_event and whose event kinds cover all of
+      trajectory.EVENT_KINDS (tool_call, shell_command, test_run,
+      file_diff, agent_snapshot).
 
 Deliberately does NOT check that any specific test can detect any specific
 operator's defect - doing so would mean writing a golden/answer test into
@@ -69,6 +75,7 @@ import grade
 import mutate
 import scheduler
 import substrate
+import trajectory
 
 HERE = pathlib.Path(__file__).resolve().parent
 CLEAN = HERE / "clean"
@@ -77,6 +84,7 @@ RUNNER = HERE / "run_sql_tests.py"
 BUILD_SEED_ROOT = HERE / "build_seed_root.py"
 GRADE = HERE / "grade.py"
 ORACLE = HERE / "oracle.py"
+SAMPLE_TRAJECTORY = HERE / "sample_trajectory.py"
 
 _failures: list[str] = []
 
@@ -499,6 +507,61 @@ def check_official_tests_dont_leak_seeded_defect_location(tmp: pathlib.Path) -> 
         ok("a real seed-root's sql-tests/official/ has no seeded-defect leaks or dangling sibling-.test references")
 
 
+def check_run_sql_tests_trajectory_log(tmp: pathlib.Path) -> None:
+    """#40's run_sql_tests.py --trajectory-log wiring, checked directly:
+    a plain run against clean/sql-tests/official appends exactly one
+    schema-valid test_run event whose summary matches the run's own
+    (zero-failure) result."""
+    root = tmp / "trajectory-flag-check"
+    root.mkdir(parents=True)
+    log_path = root / "trajectory.jsonl"
+    proc = subprocess.run(
+        [sys.executable, "-B", str(RUNNER), "--root", str(CLEAN), "--trajectory-log", str(log_path), str(OFFICIAL)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        fail(f"run_sql_tests.py --trajectory-log: run against clean/sql-tests/official unexpectedly failed:\n{proc.stdout}{proc.stderr}")
+        return
+    events = trajectory.read_events(log_path)
+    if len(events) != 1 or events[0]["kind"] != "test_run":
+        fail(f"run_sql_tests.py --trajectory-log: expected exactly one test_run event, got {events}")
+        return
+    errors = trajectory.validate_event(events[0])
+    if errors:
+        fail(f"run_sql_tests.py --trajectory-log: emitted event fails schema validation: {errors}")
+        return
+    summary = events[0]["summary"]
+    if summary["total_failures"] != 0 or events[0]["exit_code"] != 0:
+        fail(f"run_sql_tests.py --trajectory-log: test_run event doesn't match a passing run: {events[0]}")
+    else:
+        ok("run_sql_tests.py --trajectory-log: appends one schema-valid test_run event matching the run's own result")
+
+
+def check_sample_trajectory_covers_every_event_kind(tmp: pathlib.Path) -> None:
+    """#40's acceptance criteria, checked end to end rather than just
+    asserted: sample_trajectory.py's scripted stand-in trial produces a
+    trajectory.jsonl whose every line is schema-valid and whose event
+    kinds cover all of trajectory.EVENT_KINDS."""
+    out = tmp / "trajectory-sample"
+    proc = subprocess.run(
+        [sys.executable, "-B", str(SAMPLE_TRAJECTORY), "--seed", "40", "--out", str(out)],
+        capture_output=True, text=True,
+    )
+    manifest_line = next((line for line in proc.stdout.splitlines() if line.startswith("TRAJECTORY_JSON: ")), None)
+    if manifest_line is None:
+        fail(f"sample_trajectory.py did not print a TRAJECTORY_JSON: line:\n{proc.stdout}{proc.stderr}")
+        return
+    result = json.loads(manifest_line[len("TRAJECTORY_JSON: "):])
+    if proc.returncode != 0 or result["errors"]:
+        fail(f"sample_trajectory.py reported error(s): {result['errors']}")
+        return
+    missing = [kind for kind in trajectory.EVENT_KINDS if result["event_counts"].get(kind, 0) < 1]
+    if missing:
+        fail(f"sample_trajectory.py's trajectory.jsonl never emitted these event kind(s): {missing}")
+    else:
+        ok(f"sample_trajectory.py: trajectory.jsonl covers all of trajectory.EVENT_KINDS ({result['event_counts']})")
+
+
 def check_build_seed_root_and_grade_end_to_end(tmp: pathlib.Path) -> None:
     root = tmp / "e2e-seed-root"
     proc = subprocess.run(
@@ -568,6 +631,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="tinytable-evals-selfcheck-") as td:
         tmp = pathlib.Path(td)
         check_run_sql_tests_admissibility_flag(tmp)
+        check_run_sql_tests_trajectory_log(tmp)
+        check_sample_trajectory_covers_every_event_kind(tmp)
         check_operators(tmp)
         check_build_seed_root_and_grade_end_to_end(tmp)
         check_grade_probabilistic_runs_end_to_end(tmp)

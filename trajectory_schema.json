@@ -1,0 +1,130 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/clemenza/tinytable-evals/trajectory_schema.json",
+  "title": "tinytable-evals trajectory event",
+  "description": "One line of a trial's JSONL trajectory log (issue #40). Each line is a self-contained JSON object matching this schema; see trajectory.py's module docstring for the full rationale and trajectory.validate_event for the hand-rolled (stdlib-only) equivalent of this schema used by selfcheck.py.",
+  "type": "object",
+  "required": ["seq", "ts", "kind"],
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "description": "Monotonic counter per TrajectoryWriter instance - NOT globally unique across processes. Use ts (and physical line order) for cross-process ordering."
+    },
+    "ts": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp of when this event was written."
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["tool_call", "shell_command", "test_run", "file_diff", "agent_snapshot"]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "tool_call" } } },
+      "then": {
+        "required": ["name", "input", "output", "duration_ms", "error"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1, "description": "The tool's name, e.g. 'read_file' or 'edit_file'." },
+          "input": { "description": "The tool call's input, in whatever shape the calling driver's agent framework uses. May be null." },
+          "output": { "description": "The tool call's output/result. May be null." },
+          "duration_ms": { "type": ["number", "null"] },
+          "error": { "type": ["string", "null"], "description": "Non-null iff the tool call raised/failed." }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "shell_command" } } },
+      "then": {
+        "required": ["command", "cwd", "exit_code", "stdout", "stderr", "duration_ms"],
+        "properties": {
+          "command": { "description": "The command as run - a string or an argv array." },
+          "cwd": { "type": ["string", "null"] },
+          "exit_code": { "type": ["integer", "null"] },
+          "stdout": { "type": ["string", "null"] },
+          "stderr": { "type": ["string", "null"] },
+          "duration_ms": { "type": ["number", "null"] }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "test_run" } } },
+      "then": {
+        "required": ["command", "root", "paths", "sim_seed", "check_admissibility", "exit_code", "duration_ms", "summary", "results"],
+        "properties": {
+          "command": { "type": "array", "items": { "type": "string" }, "description": "The run_sql_tests.py invocation's argv." },
+          "root": { "type": "string", "description": "The --root passed to run_sql_tests.py." },
+          "paths": { "type": "array", "items": { "type": "string" }, "description": "The *.test file/directory arguments passed." },
+          "sim_seed": { "type": "integer" },
+          "check_admissibility": { "type": "boolean" },
+          "exit_code": { "type": "integer" },
+          "duration_ms": { "type": "number" },
+          "summary": {
+            "type": "object",
+            "required": ["files", "total_failures", "total_skips"],
+            "properties": {
+              "files": { "type": "integer" },
+              "total_failures": { "type": "integer" },
+              "total_skips": { "type": "integer" }
+            }
+          },
+          "results": {
+            "type": "array",
+            "description": "Per-file breakdown, in the order run_sql_tests.py executed them.",
+            "items": {
+              "type": "object",
+              "required": ["path", "failures", "skips"],
+              "properties": {
+                "path": { "type": "string" },
+                "failures": { "type": "integer" },
+                "skips": { "type": "integer" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "file_diff" } } },
+      "then": {
+        "required": ["root", "baseline_ref", "files_changed", "diff"],
+        "properties": {
+          "root": { "type": "string" },
+          "baseline_ref": { "type": "string", "description": "The git ref the diff is against, e.g. 'HEAD' (the seed-root's pristine baseline commit)." },
+          "files_changed": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 2,
+              "maxItems": 3,
+              "description": "[status, path] from 'git diff --name-status', or [status, old_path, new_path] for a rename/copy."
+            }
+          },
+          "diff": { "type": "string", "description": "Full unified diff text; empty string if there is no diff." }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "agent_snapshot" } } },
+      "then": {
+        "required": ["subdir", "files"],
+        "properties": {
+          "subdir": { "type": "string", "description": "Directory snapshotted, relative to the seed-root - normally 'sql-tests/agent'." },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["path", "sha256", "size"],
+              "properties": {
+                "path": { "type": "string" },
+                "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                "size": { "type": "integer" }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -33,6 +33,12 @@ conflict-serializability check (#21), reported as a "[admissibility]"
 failure on violation.
 
 Exit code 0 iff every record in every file passed (skips don't count).
+
+`--trajectory-log PATH` (issue #40, opt-in, off by default) appends one
+`test_run` event to PATH's JSONL trajectory log (see trajectory.py)
+recording this invocation's command, root, per-file failure/skip counts,
+and wall time - the "every run_sql_tests.py invocation + its result" piece
+of #40's acceptance criteria that only this file can observe directly.
 """
 
 from __future__ import annotations
@@ -41,12 +47,14 @@ import argparse
 import operator as operator_module
 import pathlib
 import sys
+import time
 from dataclasses import dataclass
 from typing import Optional, Union
 
 import admissibility
 import scheduler
 import substrate
+import trajectory
 
 
 SUPPORTED_GRAMMAR_VERSIONS = ("1", "2")
@@ -618,9 +626,14 @@ def main() -> int:
         help="run every 'permutation' record's observed history through admissibility.py's "
         "conflict-serializability check (#21); off by default",
     )
+    parser.add_argument(
+        "--trajectory-log", default=None,
+        help="append a 'test_run' JSONL event for this invocation to this path (issue #40); off by default",
+    )
     parser.add_argument("paths", nargs="+", help="*.test files, or directories to search for them")
     args = parser.parse_args()
 
+    started = time.monotonic()
     root = pathlib.Path(args.root).resolve()
     sys.path.insert(0, str(root))
     import tinytable  # local import: must happen after sys.path is set up
@@ -632,6 +645,7 @@ def main() -> int:
 
     total_failures = 0
     total_skips = 0
+    results = []
     for path in files:
         try:
             failures, skips = run_file(path, tinytable, sim_seed=args.sim_seed, check_admissibility=args.check_admissibility)
@@ -639,6 +653,7 @@ def main() -> int:
             print(f"FAIL {path} (malformed test file)")
             print(f"  {exc}")
             total_failures += 1
+            results.append({"path": str(path), "failures": 1, "skips": 0})
             continue
         if failures:
             total_failures += len(failures)
@@ -652,14 +667,31 @@ def main() -> int:
             total_skips += len(skips)
             for line, message in skips:
                 print(f"  SKIP line {line}: {message}")
+        results.append({"path": str(path), "failures": len(failures), "skips": len(skips)})
 
     print()
+    exit_code = 0
     if total_failures:
         print(f"{total_failures} failure(s) across {len(files)} file(s)")
-        return 1
-    extra = f" ({total_skips} record(s) skipped - grammar directives without runtime support yet)" if total_skips else ""
-    print(f"all {len(files)} file(s) passed{extra}")
-    return 0
+        exit_code = 1
+    else:
+        extra = f" ({total_skips} record(s) skipped - grammar directives without runtime support yet)" if total_skips else ""
+        print(f"all {len(files)} file(s) passed{extra}")
+
+    if args.trajectory_log:
+        trajectory.TrajectoryWriter(args.trajectory_log).log_test_run(
+            command=[sys.executable, str(pathlib.Path(__file__).name), "--root", args.root, "--sim-seed", str(args.sim_seed), *args.paths],
+            root=args.root,
+            paths=args.paths,
+            sim_seed=args.sim_seed,
+            check_admissibility=args.check_admissibility,
+            exit_code=exit_code,
+            duration_ms=(time.monotonic() - started) * 1000,
+            summary={"files": len(files), "total_failures": total_failures, "total_skips": total_skips},
+            results=results,
+        )
+
+    return exit_code
 
 
 if __name__ == "__main__":
