@@ -66,6 +66,9 @@ copy of `clean/`, and never committed anywhere.
   against both `tinytable` and `sqlite3` (stdlib) and reports where their
   results disagree, so a claimed defect can be checked against real SQL
   semantics instead of argued about. See "The differential oracle" below.
+- **`trajectory.py`** / **`trajectory_schema.json`** - structured JSONL
+  trajectory logging for one trial (issue #40). See "Trajectory logging"
+  below.
 
 ## The two-CLI integration surface
 
@@ -172,6 +175,39 @@ goes beyond what sqlite3 supports (e.g. genuine MVCC/WAL semantics) is out
 of the oracle's reach by construction and needs its own operator-level
 proof instead, same as `selfcheck.py` already does for every current
 operator (see "Why no golden tests" above).
+
+## Trajectory logging
+
+```sh
+python3 sample_trajectory.py --seed N --out DIR
+```
+
+Issue #40 (phase 1 of #38's tracking issue): a trial's JSONL trajectory
+log records what happened during it - every tool call and shell command
+an agent made, every `run_sql_tests.py` invocation and its result, the
+working tree's diff against the seed-root's pristine baseline, and
+periodic snapshots of `sql-tests/agent/` - feeding #38's later
+milestone-scoring, time-to-first-kill, and reporting sub-issues.
+
+This repo has no live agent process of its own to instrument (that's
+whatever external driver actually launches one, e.g. honeyrail's exam
+room), so `trajectory.py` splits the work: `run_sql_tests.py
+--trajectory-log PATH` emits the one event kind (`test_run`) this repo can
+observe directly, and `trajectory.py` itself - copied into every
+`build_seed_root.py`-built `DIR` for exactly this reason - is a small,
+stdlib-only, dependency-free JSONL writer a driver imports to log the
+other kinds (`tool_call`, `shell_command`) in the same schema, plus two
+convenience methods (`log_file_diff`, `log_agent_snapshot`) it can call at
+any point during a trial. See `trajectory.py`'s module docstring for the
+full event schema and `trajectory_schema.json` for the same contract as a
+JSON Schema.
+
+`sample_trajectory.py` is a runnable demonstration: it builds a seed-root
+and drives a small scripted stand-in for an exam-taking agent through it
+(same "prove it mechanically, don't write down a golden answer" trade-off
+as `selfcheck.py` elsewhere in this repo), producing one
+`trajectory.jsonl` that exercises every event kind - `selfcheck.py` runs
+it and validates the result.
 
 ## Context
 
