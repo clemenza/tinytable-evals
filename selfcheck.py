@@ -584,6 +584,43 @@ def check_run_sql_tests_trajectory_log(tmp: pathlib.Path) -> None:
         ok("run_sql_tests.py --trajectory-log: appends one schema-valid test_run event matching the run's own result")
 
 
+def check_git_diff_reports_untracked_additions(tmp: pathlib.Path) -> None:
+    """trajectory.git_diff() regression check: a plain `git diff <ref>`
+    never mentions an untracked path, and every .test file an agent adds
+    under sql-tests/agent/ starts out untracked (the seed-root's initial
+    commit only has a .gitkeep there) - so a version without the
+    `--intent-to-add` step would silently drop every agent-added test
+    file from both `diff` and `files_changed`, not just mislabel it.
+    Checked directly against a scratch git repo, independent of any real
+    seed-root, so this pins down the fix's exact mechanism."""
+    root = tmp / "git-diff-untracked-check"
+    root.mkdir(parents=True)
+    (root / "a.txt").write_text("hello\n")
+    for cmd in (
+        ["git", "init", "-q", "-b", "main"],
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "add", "-A"],
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "seed"],
+    ):
+        subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, check=True)
+
+    (root / "a.txt").write_text("hello world\n")
+    (root / "new.test").write_text("statement ok\nSELECT 1\n")
+
+    diff, files_changed = trajectory.git_diff(root)
+    statuses = {tuple(entry) for entry in files_changed}
+    if ("M", "a.txt") not in statuses:
+        fail(f"trajectory.git_diff(): expected a.txt to show as modified, got files_changed={files_changed}")
+    elif not any(status == "A" and path == "new.test" for status, path in statuses):
+        fail(
+            f"trajectory.git_diff(): a newly-added untracked file must show up as an addition, not vanish - "
+            f"got files_changed={files_changed}"
+        )
+    elif "SELECT 1" not in diff:
+        fail(f"trajectory.git_diff(): new.test's content is missing from the diff text entirely:\n{diff}")
+    else:
+        ok("trajectory.git_diff(): a newly-added (untracked) file shows up as a full addition, not silently dropped")
+
+
 def check_sample_trajectory_covers_every_event_kind(tmp: pathlib.Path) -> None:
     """#40's acceptance criteria, checked end to end rather than just
     asserted: sample_trajectory.py's scripted stand-in trial produces a
@@ -605,8 +642,25 @@ def check_sample_trajectory_covers_every_event_kind(tmp: pathlib.Path) -> None:
     missing = [kind for kind in trajectory.EVENT_KINDS if result["event_counts"].get(kind, 0) < 1]
     if missing:
         fail(f"sample_trajectory.py's trajectory.jsonl never emitted these event kind(s): {missing}")
+        return
+    ok(f"sample_trajectory.py: trajectory.jsonl covers all of trajectory.EVENT_KINDS ({result['event_counts']})")
+
+    # Regression check for the git_diff untracked-file bug: sample_trajectory.py
+    # adds sql-tests/agent/smoke.test *before* calling log_file_diff(), so the
+    # file_diff event's files_changed/diff must actually mention it - this is
+    # exactly the check that would have caught that bug the first time.
+    events = trajectory.read_events(pathlib.Path(result["trajectory_log"]))
+    file_diff_event = next(e for e in events if e["kind"] == "file_diff")
+    mentions_smoke_test = any(
+        "smoke.test" in path for entry in file_diff_event["files_changed"] for path in entry
+    )
+    if not mentions_smoke_test or "smoke.test" not in file_diff_event["diff"]:
+        fail(
+            f"sample_trajectory.py's file_diff event doesn't mention the sql-tests/agent/smoke.test it added "
+            f"before logging the diff - files_changed={file_diff_event['files_changed']}"
+        )
     else:
-        ok(f"sample_trajectory.py: trajectory.jsonl covers all of trajectory.EVENT_KINDS ({result['event_counts']})")
+        ok("sample_trajectory.py: the file_diff event correctly reports the agent-added smoke.test as an addition")
 
 
 def check_build_seed_root_and_grade_end_to_end(tmp: pathlib.Path) -> None:
@@ -679,6 +733,7 @@ def main() -> int:
         tmp = pathlib.Path(td)
         check_run_sql_tests_admissibility_flag(tmp)
         check_run_sql_tests_trajectory_log(tmp)
+        check_git_diff_reports_untracked_additions(tmp)
         check_sample_trajectory_covers_every_event_kind(tmp)
         check_operators(tmp)
         check_build_seed_root_and_grade_end_to_end(tmp)
