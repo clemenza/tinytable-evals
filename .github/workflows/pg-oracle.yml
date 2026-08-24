@@ -1,0 +1,66 @@
+name: PostgreSQL differential oracle
+
+# issue #58: catch "clean/ is no longer clean" proactively, on every push
+# that could change the baseline engine or its official corpus, rather than
+# discovering a reference bug later via a confusing agent trial (see
+# clemenza/honeyrail#130, the motivating incident for #55's tracking issue).
+#
+# A disagreement between clean/tinytable and PostgreSQL on the PG-compatible
+# semantic surface fails this job and blocks merge (branch protection is
+# expected to require this check, same as any other required status check -
+# not configured by this file itself).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "clean/**"
+      - "oracle.py"
+      - "run_sql_tests.py"
+      - "scheduler.py"
+      - "substrate.py"
+      - "admissibility.py"
+      - "docker-compose.postgres.yml"
+      - ".github/workflows/pg-oracle.yml"
+
+jobs:
+  oracle:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Kept in lockstep with docker-compose.postgres.yml's pinned
+        # image - see that file for how to re-pin both together.
+        image: postgres@sha256:38471f330eb885e04de130b768d6db4e10469e2311879c7e5c699f6d2d8a1c74
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install psycopg2 (not a stdlib module - see oracle.py's docstring)
+        run: pip install psycopg2-binary
+
+      - name: Differential-check clean/tinytable against PostgreSQL
+        run: |
+          python3 -B oracle.py --root clean --backend postgres clean/sql-tests/official
+
+      - name: Differential-check a small generated/property corpus
+        run: |
+          python3 -B oracle.py --root clean --backend postgres sql-tests/property
