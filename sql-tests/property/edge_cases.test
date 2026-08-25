@@ -1,0 +1,114 @@
+# issue #58: a small, hand-authored, stable corpus of additional
+# PG-compatible edge cases beyond clean/sql-tests/official/ - deliberately
+# small (see #58's acceptance criteria: "stays small and stable - this is
+# not a new large independent verifier"), meant only to widen what
+# oracle.py's PostgreSQL backend gets to cross-check on CI, not to
+# duplicate run_sql_tests.py's own official acceptance suite. Every record
+# here is checked two ways: run_sql_tests.py --root clean (matches SPEC.md's
+# own hardcoded expectations) and oracle.py --backend postgres (matches
+# real PostgreSQL's independent semantics) - both must agree, on every push
+# that could change clean/tinytable itself (see .github/workflows/pg-oracle.yml).
+
+statement ok
+CREATE TABLE t (a INTEGER, b INTEGER, tag TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'x')
+
+statement ok
+INSERT INTO t VALUES (NULL, 20, 'y')
+
+statement ok
+INSERT INTO t VALUES (3, NULL, 'z')
+
+# BETWEEN with a NULL row value - three-valued logic, not just a range check.
+query T rowsort
+SELECT tag FROM t WHERE a BETWEEN 0 AND 5
+----
+x
+z
+
+# IN (...) - a NULL row value never matches, even though the list itself
+# doesn't contain NULL.
+query T rowsort
+SELECT tag FROM t WHERE a IN (1, 3)
+----
+x
+z
+
+# IN (...) with a NULL in the list - the NULL is inert, per SPEC.md's NULL
+# semantics section.
+query T rowsort
+SELECT tag FROM t WHERE b IN (10, NULL)
+----
+x
+
+# NOT on a NULL comparison stays NULL/unknown, not flipped to TRUE.
+query T rowsort
+SELECT tag FROM t WHERE NOT (a = 1)
+----
+z
+
+# AND/OR short-circuit shape with NULL operands (three-valued truth table).
+query T rowsort
+SELECT tag FROM t WHERE (a = 1) OR (b = 20)
+----
+x
+y
+
+query T rowsort
+SELECT tag FROM t WHERE (a = 1) AND (b = 20)
+----
+
+# String concatenation composed with arithmetic in one SELECT item list
+# (each still exact-typed on its own - '||' never sees the numeric result).
+statement ok
+CREATE TABLE prices (item TEXT, qty INTEGER, unit_price REAL)
+
+statement ok
+INSERT INTO prices VALUES ('widget', 4, 2.5)
+
+query TR nosort
+SELECT item || '!', qty * unit_price FROM prices
+----
+widget!
+10.0
+
+# Composite UNIQUE INDEX boundary: one NULL component exempts the whole row,
+# even when the other component repeats.
+statement ok
+CREATE TABLE pair (x INTEGER, y INTEGER)
+
+statement ok
+CREATE UNIQUE INDEX uq_pair ON pair(x, y)
+
+statement ok
+INSERT INTO pair VALUES (1, NULL)
+
+statement ok
+INSERT INTO pair VALUES (1, NULL)
+
+statement ok
+INSERT INTO pair VALUES (1, 2)
+
+statement error already present
+INSERT INTO pair VALUES (1, 2)
+
+# ORDER BY ... NULLS FIRST combined with LIMIT/OFFSET.
+statement ok
+CREATE TABLE ord (k INTEGER)
+
+statement ok
+INSERT INTO ord VALUES (2)
+
+statement ok
+INSERT INTO ord VALUES (NULL)
+
+statement ok
+INSERT INTO ord VALUES (1)
+
+query I nosort
+SELECT k FROM ord ORDER BY k NULLS FIRST LIMIT 2 OFFSET 1
+----
+1
+2

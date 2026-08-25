@@ -2,7 +2,7 @@
 """grade: score a tinytable seed-root against task-prompt.md's output contract.
 
 Usage:
-    python3 grade.py --artifacts DIR [--out score.json] [--timeout 120] [--trajectory-log trajectory.jsonl]
+    python3 grade.py --artifacts DIR [--out score.json] [--timeout 120] [--trajectory-log trajectory.jsonl] [--pg-adjudicate]
 
 `--artifacts` is a seed-root as produced by `build_seed_root.py`, plus
 whatever an exam-taking agent added under `sql-tests/agent/` and
@@ -35,9 +35,20 @@ which degenerates to exactly the original single-run behavior):
      "killed on the one run", the original behavior). false_alarms = the
      total F_clean count across every seed - i.e. zero iff *every* seed's
      clean run had zero failures ("false alarm defined as zero failures
-     over N runs on clean" - #21). Each killed test is also classified
-     "invariant" (an assert_stats or --check-admissibility violation) vs
-     plain "assertion" into killed_by_kind.
+     over N runs on clean" - #21) - MINUS any record in F_mutant & F_clean
+     that --pg-adjudicate (issue #57, opt-in, off by default) got a
+     PostgreSQL oracle to confirm is actually a bug in `clean/` itself, not
+     the agent's mistake (a `reference_bug`, per TRUTH_MODEL.md - `clean/`
+     is a cheap reference, never assumed infallible; a reference_bug
+     shouldn't count against the agent, see clemenza/honeyrail#130). Every
+     other F_clean record - including one PostgreSQL adjudicates
+     `false_alarm` or can't decide (`unknown` - never silently coerced into
+     `false_alarm`, but still counted the same way for scoring purposes
+     absent a confirmed reference_bug) - keeps the original blanket
+     "failed against clean/, so it's a false alarm" treatment. Each killed
+     test is also classified "invariant" (an assert_stats or
+     --check-admissibility violation) vs plain "assertion" into
+     killed_by_kind.
   4. contract_ok = sql-tests/agent/ has at least one *.test file AND
      findings.json exists and validates against findings.schema.json AND
      `git status` in --artifacts shows tinytable/ and sql-tests/official/
@@ -46,8 +57,9 @@ which degenerates to exactly the original single-run behavior):
      `SCORE_JSON: {...}` to stdout for a driver to parse.
   6. Exit 0 iff killed and false_alarms == 0 and contract_ok, else 1.
 
-stdlib only (run_sql_tests.py, invoked as a subprocess, is itself stdlib -
-no pytest, no third-party imports anywhere in this pipeline). Each
+stdlib only by default (run_sql_tests.py, invoked as a subprocess, is
+itself stdlib - no pytest, no third-party imports anywhere in this
+pipeline, unless --pg-adjudicate is passed - see below). Each
 run_sql_tests.py invocation is subprocess.run(..., timeout=...) so a
 runaway or looping test written by the agent can't hang scoring.
 
@@ -57,6 +69,13 @@ invocation (one `test_run` event per --runs seed, appended to PATH -
 relative to --artifacts unless absolute, same convention as --out). Not
 passed to step 2's clean-reference comparison runs - see _run_sql_tests's
 docstring for why relative wouldn't even reach a caller there.
+
+`--pg-adjudicate` (issue #57, opt-in, off by default) calls
+adjudicate.classify() - which needs psycopg2 and a reachable PostgreSQL
+server, same setup as oracle.py's `--backend postgres` - once per record in
+`F_mutant & F_clean` (the fast path is preserved: nothing else triggers a
+PostgreSQL round trip). Each verdict, and a per-run/overall tally, are
+recorded in score.json's `pg_adjudicated`/`pg_adjudication_tally` fields.
 
 This is one of the two CLIs honeyrail's builder integrates against (the
 other is build_seed_root.py).
@@ -268,6 +287,58 @@ def _tally_kinds(killed_tests: list[str], kind_by_id: dict[str, str]) -> dict[st
     return tally
 
 
+# ---------------------------------------------------------------------------
+# PostgreSQL-backed adjudication of baseline-vs-agent disagreements (#57)
+# ---------------------------------------------------------------------------
+
+
+def _adjudicate_disputed(disputed_ids: list[str], artifacts: pathlib.Path, clean: pathlib.Path) -> dict[str, dict]:
+    """Classify every id in `disputed_ids` (records failing against *both*
+    the mutant and the untouched baseline - `F_mutant & F_clean`) as
+    "reference_bug", "false_alarm", or "unknown" via adjudicate.py's
+    PostgreSQL-backed adjudicator.
+
+    Imported in-process rather than shelled out to like every
+    run_sql_tests.py call elsewhere in this file: unlike those (which
+    compare two *different* tinytable installs - artifacts' mutant vs. a
+    temp copy of this repo's own clean/ - and so need separate processes
+    to dodge Python's module cache reusing the first root's `tinytable`
+    import), adjudicate.classify() only ever imports `clean`'s own
+    baseline install, the same root on every call in this loop - the
+    module-cache reuse across calls here is exactly what's wanted, not a
+    hazard.
+    """
+    import adjudicate  # local import: only needed (and only requires psycopg2) when --pg-adjudicate is passed
+
+    results = {}
+    for test_id in disputed_ids:
+        path_str, _, line_str = test_id.rpartition(":")
+        if not path_str or line_str == "0":
+            results[test_id] = {"outcome": "unknown", "detail": "malformed-test-file failure has no single record to adjudicate"}
+            continue
+        results[test_id] = adjudicate.classify(artifacts / path_str, int(line_str), clean)
+    return results
+
+
+def _apply_adjudication(f_clean: set[str], adjudicated: dict[str, dict]) -> tuple[int, dict[str, int]]:
+    """(false_alarms, outcome_tally) for one run, given this run's raw
+    F_clean and the adjudication verdicts for its disputed ids (a subset of
+    F_clean - see _adjudicate_disputed). A record classified reference_bug
+    is removed from the false-alarm count entirely (issue #57: "a
+    reference_bug outcome shouldn't count against an agent"); every other
+    F_clean record - unadjudicated, or adjudicated false_alarm/unknown -
+    keeps counting as a false alarm, same as grade.py's original blanket
+    "any agent test failing against clean/ is a false alarm" rule, since
+    unknown is deliberately never coerced into a *lower* false-alarm count
+    either (issue #57's acceptance criteria).
+    """
+    tally = {"reference_bug": 0, "false_alarm": 0, "unknown": 0}
+    for test_id, verdict in adjudicated.items():
+        tally[verdict["outcome"]] += 1
+    false_alarms = len(f_clean) - tally["reference_bug"]
+    return false_alarms, tally
+
+
 def grade(
     artifacts: pathlib.Path,
     clean: pathlib.Path,
@@ -276,6 +347,7 @@ def grade(
     kill_rate_threshold: float = 1.0,
     check_admissibility: bool = False,
     trajectory_log: Optional[str] = None,
+    pg_adjudicate: bool = False,
 ) -> dict:
     contract_errors = _check_contract(artifacts)
     contract_ok = not contract_errors
@@ -314,15 +386,34 @@ def grade(
                 f_clean = set()
 
             killed_tests = sorted(f_mutant - f_clean)
+
+            # #57: a record failing against *both* the mutant and the
+            # untouched baseline used to be an automatic false alarm, full
+            # stop - which is wrong when clean/ itself is the one with the
+            # bug. --pg-adjudicate asks PostgreSQL to settle exactly that
+            # disputed subset (F_mutant & F_clean); everything else in
+            # F_clean keeps the original blanket rule (see
+            # _apply_adjudication's docstring). Off by default: this repo's
+            # other CLIs stay stdlib-only and zero-setup unless asked.
+            if pg_adjudicate:
+                disputed = sorted(f_mutant & f_clean)
+                adjudicated = _adjudicate_disputed(disputed, artifacts, clean)
+                false_alarms, adjudication_tally = _apply_adjudication(f_clean, adjudicated)
+            else:
+                adjudicated, adjudication_tally = {}, None
+                false_alarms = len(f_clean)
+
             per_run.append(
                 {
                     "seed": seed,
                     "killed": bool(killed_tests),
                     "killed_tests": killed_tests,
                     "killed_by_kind": _tally_kinds(killed_tests, kinds_mutant),
-                    "false_alarms": len(f_clean),
+                    "false_alarms": false_alarms,
                     "f_mutant": sorted(f_mutant),
                     "f_clean": sorted(f_clean),
+                    "pg_adjudicated": adjudicated,
+                    "pg_adjudication_tally": adjudication_tally,
                 }
             )
 
@@ -337,6 +428,13 @@ def grade(
             killed_by_kind[k] += v
     passed = killed and false_alarms == 0 and contract_ok and error is None
 
+    pg_adjudication_tally: Optional[dict[str, int]] = None
+    if pg_adjudicate:
+        pg_adjudication_tally = {"reference_bug": 0, "false_alarm": 0, "unknown": 0}
+        for r in per_run:
+            for k, v in (r["pg_adjudication_tally"] or {}).items():
+                pg_adjudication_tally[k] += v
+
     return {
         "artifacts": str(artifacts),
         "clean": str(clean),
@@ -347,6 +445,8 @@ def grade(
         "killed_tests": killed_tests,
         "killed_by_kind": killed_by_kind,
         "false_alarms": false_alarms,
+        "pg_adjudicate": pg_adjudicate,
+        "pg_adjudication_tally": pg_adjudication_tally,
         "contract_ok": contract_ok,
         "contract_errors": contract_errors,
         "f_mutant": sorted({t for r in per_run for t in r["f_mutant"]}),
@@ -384,6 +484,14 @@ def main() -> int:
         "absolute, same convention as --out. Not passed to the internal clean-reference comparison runs (their "
         "root is a temp directory deleted before this process exits). Off by default.",
     )
+    parser.add_argument(
+        "--pg-adjudicate", action="store_true",
+        help="issue #57: ask a PostgreSQL oracle (via adjudicate.py) to settle every record that fails against "
+        "*both* the mutant and clean/ - PostgreSQL agreeing with the agent's assertion is a reference_bug, not a "
+        "false_alarm (see TRUTH_MODEL.md). Off by default - requires psycopg2 and a reachable server, same setup "
+        "as oracle.py --backend postgres; every other --artifacts/--clean record still counts as a false alarm "
+        "exactly as before, so the fast path (no PostgreSQL calls at all) is unchanged unless this is passed.",
+    )
     args = parser.parse_args()
 
     artifacts = pathlib.Path(args.artifacts).resolve()
@@ -398,7 +506,7 @@ def main() -> int:
     result = grade(
         artifacts, clean, args.timeout,
         runs=args.runs, kill_rate_threshold=args.kill_rate_threshold, check_admissibility=args.check_admissibility,
-        trajectory_log=args.trajectory_log,
+        trajectory_log=args.trajectory_log, pg_adjudicate=args.pg_adjudicate,
     )
 
     out_path = pathlib.Path(args.out)

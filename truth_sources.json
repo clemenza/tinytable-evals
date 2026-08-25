@@ -1,0 +1,90 @@
+{
+  "$schema_note": "issue #55's per-feature truth-source labeling. `source` is one of postgres|invariant|none, per TRUTH_MODEL.md. A `none`-labeled feature must never enter a scored pack (#53) until it gains either a postgres or invariant source - see TRUTH_MODEL.md's 'Enforcement' section.",
+  "features": [
+    {
+      "spec_section": "SQL Surface",
+      "source": "postgres",
+      "note": "tinytable's grammar is a subset of standard SQL - oracle.py's postgres backend adjudicates every statement/query it can produce."
+    },
+    {
+      "spec_section": "Column Types",
+      "source": "postgres",
+      "note": "PostgreSQL adjudicates the underlying type system; tinytable's own exact-match strictness is a documented intentional divergence (oracle.py's INTENTIONAL_DIVERGENCES), not left unlabeled."
+    },
+    {
+      "spec_section": "NULL semantics (three-valued logic)",
+      "source": "postgres",
+      "note": "standard SQL three-valued logic - PostgreSQL is a faithful independent implementation. (This is the class of bug that shipped in clean/tinytable's own Not predicate until issue #55's rollout caught it - see git history around this file's introduction.)"
+    },
+    {
+      "spec_section": "Expressions in SELECT",
+      "source": "postgres",
+      "note": "arithmetic/concat/NULL-propagation are standard SQL; tinytable's exact operand typing is a documented intentional divergence, same as Column Types above."
+    },
+    {
+      "spec_section": "ORDER BY / NULLS FIRST|LAST",
+      "source": "postgres",
+      "note": "standard SQL, including NULL placement - PostgreSQL adjudicates directly."
+    },
+    {
+      "spec_section": "LIMIT / OFFSET",
+      "source": "postgres",
+      "note": "standard SQL - PostgreSQL has no bare-OFFSET restriction either, unlike sqlite3 (see oracle.py's _to_sqlite_sql)."
+    },
+    {
+      "spec_section": "Secondary index (single-column and composite)",
+      "source": "postgres",
+      "note": "an index is a pure optimization: the invariant is 'same result as an unindexed query', which oracle.py's result comparison verifies without needing any PostgreSQL-specific index concept at all."
+    },
+    {
+      "spec_section": "Uniqueness (single-column and composite)",
+      "source": "postgres",
+      "note": "standard SQL UNIQUE semantics including NULL exemption - PostgreSQL adjudicates directly."
+    },
+    {
+      "spec_section": "Constraints: NOT NULL / CHECK / FOREIGN KEY",
+      "source": "postgres",
+      "note": "standard SQL; CHECK's three-valued semantics and FOREIGN KEY's RESTRICT-only behavior both verified empirically to match real PostgreSQL (see oracle.py's module docstring)."
+    },
+    {
+      "spec_section": "SAVEPOINT / ROLLBACK TO / RELEASE / COMMIT",
+      "source": "postgres",
+      "note": "standard SQL savepoint semantics. Known gap (documented, not silent): oracle.py's blind-spot fix does not yet extend to a tinytable REJECTION of one of these four control statements specifically - see oracle.py's module docstring."
+    },
+    {
+      "spec_section": "Aggregates: COUNT / MIN / MAX",
+      "source": "postgres",
+      "note": "standard SQL aggregate semantics, including COUNT(*) vs COUNT(col) NULL handling."
+    },
+    {
+      "spec_section": "Grammar v2: session / step / permutation (ordering only, single-threaded)",
+      "source": "postgres",
+      "note": "each step's own SQL is ordinary PG-adjudicable statement/query content."
+    },
+    {
+      "spec_section": "Grammar v2: session / step / permutation (cross-session interleaving/visibility)",
+      "source": "invariant",
+      "note": "no MVCC visibility semantics exist yet (see #10); admissibility.py's conflict-serializability checker (#21, run_sql_tests.py --check-admissibility) is the local invariant this repo already has for it, per #22's 'history-admissibility, not a reference model' policy."
+    },
+    {
+      "spec_section": "Grammar v2: crash / restart / checkpoint",
+      "source": "none",
+      "note": "SPEC.md is explicit: 'nothing wires Database to this Simulation yet ... none of this has an SQL-visible effect' - not scorable today. #22's planned invariant once #11's WAL lands: committed data survives restart, uncommitted data never becomes visible, recovery is idempotent - none of that is a per-feature reference model."
+    },
+    {
+      "spec_section": "Grammar v2: repeat / advance_clock / threshold (long-soak)",
+      "source": "none",
+      "note": "advance_clock has no SQL-visible effect yet (no TTL/retention feature reads the clock); threshold is grammar-only, not yet executing (#21's history-across-repeat-iterations plumbing isn't implemented). repeat itself is just a loop around already-classified statement/query records."
+    },
+    {
+      "spec_section": "Grammar v2: explain",
+      "source": "none",
+      "note": "no query planner exists yet (#12) - reported skipped, not scorable."
+    },
+    {
+      "spec_section": "Grammar v2: assert stats",
+      "source": "invariant",
+      "note": "Database.stats() internal counters (#21) are inherently not SQL-visible/PG-adjudicable - bounded/converges are exactly the kind of local invariant #22 describes as the right lightweight tool here."
+    }
+  ]
+}

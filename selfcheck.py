@@ -45,6 +45,24 @@ two CLIs (build_seed_root.py, grade.py). Verifies:
       trajectory.validate_event and whose event kinds cover all of
       trajectory.EVENT_KINDS (tool_call, shell_command, test_run,
       file_diff, agent_snapshot).
+  (l0) issue #55: truth_sources.json's per-SPEC.md-feature truth-source
+      labels (postgres | invariant | none) are well-formed - see
+      TRUTH_MODEL.md and check_truth_sources_labels_are_well_formed().
+  (l) issue #56: oracle.py --backend postgres agrees with clean/tinytable
+      on both the official suite and #58's small property corpus - i.e.
+      not just self-consistent or sqlite3-consistent, but consistent with
+      PostgreSQL's real, strictly-typed SQL semantics (see TRUTH_MODEL.md).
+      Skipped, not failed, when psycopg2/a reachable server aren't
+      available locally - see check_postgres_oracle_agrees_with_clean()'s
+      own docstring.
+  (m) issue #57: grade.py --pg-adjudicate classifies a record failing
+      against both --artifacts and --clean as reference_bug when
+      PostgreSQL backs the agent's own assertion over clean/'s (here,
+      deliberately reintroduced-buggy) actual behavior, and as false_alarm
+      when the agent's assertion instead contradicts one of oracle.py's
+      documented INTENTIONAL_DIVERGENCES - see check_pg_adjudication()'s
+      own docstring. Also skipped, not failed, without a reachable
+      PostgreSQL.
 
 Deliberately does NOT check that any specific test can detect any specific
 operator's defect - doing so would mean writing a golden/answer test into
@@ -80,6 +98,7 @@ import trajectory
 HERE = pathlib.Path(__file__).resolve().parent
 CLEAN = HERE / "clean"
 OFFICIAL = CLEAN / "sql-tests" / "official"
+PROPERTY = HERE / "sql-tests" / "property"
 RUNNER = HERE / "run_sql_tests.py"
 BUILD_SEED_ROOT = HERE / "build_seed_root.py"
 GRADE = HERE / "grade.py"
@@ -115,6 +134,50 @@ def check_official_suite_passes_on_clean() -> None:
         fail(f"official suite fails on clean:\n{output}")
 
 
+def check_truth_sources_labels_are_well_formed() -> None:
+    """issue #55's acceptance criteria: "every scored SPEC feature is
+    labeled with a truth source: postgres | invariant | none". This repo
+    has no scored-pack machinery yet (#53 is a separate tracking issue) to
+    check that against, so this is the inventory-level check available
+    today: truth_sources.json parses, every entry has a non-empty
+    spec_section/note and a `source` in the three allowed values, and no
+    spec_section is listed twice.
+    """
+    path = HERE / "truth_sources.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"truth_sources.json: could not read/parse: {exc}")
+        return
+
+    features = data.get("features")
+    if not isinstance(features, list) or not features:
+        fail("truth_sources.json: 'features' must be a non-empty list")
+        return
+
+    errors = []
+    seen = set()
+    for i, entry in enumerate(features):
+        section = entry.get("spec_section")
+        source = entry.get("source")
+        note = entry.get("note")
+        if not isinstance(section, str) or not section:
+            errors.append(f"features[{i}]: missing/empty spec_section")
+        elif section in seen:
+            errors.append(f"features[{i}]: duplicate spec_section {section!r}")
+        else:
+            seen.add(section)
+        if source not in ("postgres", "invariant", "none"):
+            errors.append(f"features[{i}] ({section!r}): source must be postgres|invariant|none, got {source!r}")
+        if not isinstance(note, str) or not note:
+            errors.append(f"features[{i}] ({section!r}): missing/empty note")
+
+    if errors:
+        fail("truth_sources.json: " + "; ".join(errors))
+    else:
+        ok(f"truth_sources.json: {len(features)} SPEC.md feature(s) labeled postgres|invariant|none")
+
+
 def check_oracle_agrees_with_clean() -> None:
     proc = subprocess.run(
         [sys.executable, "-B", str(ORACLE), "--root", str(CLEAN), str(OFFICIAL)],
@@ -125,6 +188,33 @@ def check_oracle_agrees_with_clean() -> None:
         ok("oracle.py: clean/tinytable agrees with sqlite3 on clean/sql-tests/official/")
     else:
         fail(f"oracle.py: clean/tinytable disagrees with sqlite3:\n{proc.stdout}{proc.stderr}")
+
+
+def check_postgres_oracle_agrees_with_clean() -> None:
+    """issue #56: like check_oracle_agrees_with_clean() above, but against
+    the postgres backend, over both the official suite and #58's small
+    property corpus. Skipped (not failed - this is the same "reported
+    distinctly, never counted against the exit code" treatment as an
+    unsupported grammar directive elsewhere in this repo) whenever psycopg2
+    isn't installed or no server is reachable via the standard libpq
+    PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE environment variables - see
+    oracle.py's module docstring and docker-compose.postgres.yml for setup.
+    A real, reachable PostgreSQL is exactly what CI's pg-oracle.yml workflow
+    always provides, so this check has real teeth there even though it's
+    optional for a bare local `python3 selfcheck.py`.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-B", str(ORACLE), "--root", str(CLEAN), "--backend", "postgres", str(OFFICIAL), str(PROPERTY)],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 2:
+        print(f"skip oracle.py --backend postgres: {proc.stderr.strip()}")
+        return
+    if proc.returncode == 0:
+        ok("oracle.py --backend postgres: clean/tinytable agrees with PostgreSQL")
+    else:
+        fail(f"oracle.py --backend postgres: clean/tinytable disagrees with PostgreSQL:\n{proc.stdout}{proc.stderr}")
 
 
 def check_scheduler_is_deterministic_and_usable_standalone() -> None:
@@ -352,6 +442,88 @@ def check_grade_kind_classification() -> None:
         fail("grade.py: an untagged (e.g. malformed-file) failure should default to 'assertion'")
     else:
         ok("grade.py: an untagged failure defaults to 'assertion'")
+
+
+def check_pg_adjudication(tmp: pathlib.Path) -> None:
+    """issue #57: grade.py --pg-adjudicate reclassifies a record failing
+    against *both* --artifacts and --clean as reference_bug (not
+    false_alarm) when PostgreSQL agrees with the agent's own assertion, not
+    clean's actual (here, deliberately reintroduced-buggy) behavior - while
+    a genuinely wrong agent assertion whose baseline rejection matches a
+    documented oracle.INTENTIONAL_DIVERGENCES entry stays false_alarm
+    without even needing PostgreSQL's answer (see adjudicate.py). Skipped,
+    not failed, when psycopg2/a reachable server aren't available - same
+    treatment as check_postgres_oracle_agrees_with_clean().
+    """
+    buggy_clean = tmp / "buggy-clean-for-pg-adjudication"
+    shutil.copytree(CLEAN, buggy_clean)
+    core_path = buggy_clean / "tinytable" / "core.py"
+    source = core_path.read_text()
+    correct = (
+        "class Not(Predicate):\n"
+        "    def __init__(self, inner: Predicate):\n"
+        "        self.inner = inner\n"
+        "\n"
+        "    def _tri(self, row: dict) -> Optional[bool]:\n"
+        "        inner = self.inner._tri(row)\n"
+        "        return None if inner is None else (not inner)\n"
+    )
+    reintroduced_bug = (
+        "class Not(Predicate):\n"
+        "    def __init__(self, inner: Predicate):\n"
+        "        self.inner = inner\n"
+        "\n"
+        "    def _tri(self, row: dict) -> Optional[bool]:\n"
+        "        return not self.inner.matches(row)\n"
+    )
+    if correct not in source:
+        fail("check_pg_adjudication: clean/tinytable/core.py's Not._tri no longer matches the text this check patches - update it")
+        return
+    core_path.write_text(source.replace(correct, reintroduced_bug))
+
+    artifacts = tmp / "pg-adjudication-artifacts"
+    (artifacts / "sql-tests" / "agent").mkdir(parents=True)
+    shutil.copytree(buggy_clean / "tinytable", artifacts / "tinytable")
+    # a real reference bug: NOT (a = 1) for a NULL `a` must stay UNKNOWN
+    # (excluded), not become "not False, so True" - the buggy Not._tri
+    # above wrongly includes it. The agent's assertion here is the
+    # SPEC-correct one; clean/'s own (patched-buggy) actual behavior isn't.
+    (artifacts / "sql-tests" / "agent" / "refbug.test").write_text(
+        "statement ok\nCREATE TABLE t (a INTEGER, tag TEXT)\n\n"
+        "statement ok\nINSERT INTO t VALUES (1, 'x')\n\n"
+        "statement ok\nINSERT INTO t VALUES (NULL, 'y')\n\n"
+        "statement ok\nINSERT INTO t VALUES (3, 'z')\n\n"
+        "query T rowsort\nSELECT tag FROM t WHERE NOT (a = 1)\n----\nz\n"
+    )
+    # a genuinely wrong agent assertion: tinytable's exact column typing
+    # (SPEC.md's "Column Types") deliberately rejects this, matching
+    # oracle.py's own INTENTIONAL_DIVERGENCES - not a reference bug no
+    # matter how permissive PostgreSQL itself would be about it.
+    (artifacts / "sql-tests" / "agent" / "falsealarm.test").write_text(
+        "statement ok\nCREATE TABLE t2 (name TEXT)\n\nstatement ok\nINSERT INTO t2 VALUES (5)\n"
+    )
+    (artifacts / "findings.json").write_text("[]")
+
+    proc = subprocess.run(
+        [sys.executable, "-B", str(GRADE), "--artifacts", str(artifacts), "--clean", str(buggy_clean),
+         "--out", "score.json", "--pg-adjudicate"],
+        capture_output=True, text=True,
+    )
+    score_path = artifacts / "score.json"
+    if not score_path.is_file():
+        fail(f"check_pg_adjudication: grade.py --pg-adjudicate produced no score.json:\n{proc.stdout}{proc.stderr}")
+        return
+    score = json.loads(score_path.read_text())
+    adjudicated = score["per_run"][0]["pg_adjudicated"]
+    if any("PostgreSQL oracle unavailable" in v.get("detail", "") for v in adjudicated.values()):
+        print("skip check_pg_adjudication: PostgreSQL oracle not available locally")
+        return
+
+    tally = score.get("pg_adjudication_tally") or {}
+    if tally.get("reference_bug") == 1 and tally.get("false_alarm") == 1 and tally.get("unknown", 0) == 0:
+        ok("grade.py --pg-adjudicate: a real baseline bug is reference_bug; a genuinely wrong assertion stays false_alarm")
+    else:
+        fail(f"grade.py --pg-adjudicate: expected tally {{'reference_bug': 1, 'false_alarm': 1, 'unknown': 0}}, got {tally}\n{adjudicated}")
 
 
 def check_grade_probabilistic_runs_end_to_end(tmp: pathlib.Path) -> None:
@@ -722,7 +894,9 @@ def main() -> int:
         return 1
 
     check_official_suite_passes_on_clean()
+    check_truth_sources_labels_are_well_formed()
     check_oracle_agrees_with_clean()
+    check_postgres_oracle_agrees_with_clean()
     check_scheduler_is_deterministic_and_usable_standalone()
     check_substrate_is_deterministic()
     check_database_stats()
@@ -738,6 +912,7 @@ def main() -> int:
         check_operators(tmp)
         check_build_seed_root_and_grade_end_to_end(tmp)
         check_grade_probabilistic_runs_end_to_end(tmp)
+        check_pg_adjudication(tmp)
         check_grade_trajectory_log(tmp)
         check_official_tests_dont_leak_seeded_defect_location(tmp)
 

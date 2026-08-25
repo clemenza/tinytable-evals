@@ -45,9 +45,21 @@ class Predicate:
     """Base class for the composable WHERE-clause objects returned by
     eq()/ne()/.../is_null()/not_null(). Combine with & (AND), | (OR), and
     ~ (NOT); pass the result to Table.where()/select().
+
+    Internally three-valued (see `_tri`), because SPEC.md's NULL semantics
+    require it: `NOT (x = 1)` for a NULL `x` must stay UNKNOWN, not become
+    "not False, so True" - collapsing UNKNOWN to False *inside* the tree
+    (rather than only at the final matches() decision below) would make a
+    NOT anywhere in the tree flip an unknown comparison into a spurious
+    match. `matches()` is the public two-valued decision every caller
+    outside this class hierarchy actually uses: a row is kept iff the
+    predicate is definitely True - both False and UNKNOWN exclude it.
     """
 
     def matches(self, row: dict) -> bool:
+        return self._tri(row) is True
+
+    def _tri(self, row: dict) -> Optional[bool]:
         raise NotImplementedError
 
     def __and__(self, other: "Predicate") -> "Predicate":
@@ -78,10 +90,10 @@ class Comparison(Predicate):
         self.op = op
         self.value = value
 
-    def matches(self, row: dict) -> bool:
+    def _tri(self, row: dict) -> Optional[bool]:
         v = row.get(self.column)
         if v is None or self.value is None:
-            return False
+            return None
         return _COMPARISON_OPS[self.op](v, self.value)
 
 
@@ -93,10 +105,10 @@ class Between(Predicate):
         self.lo = lo
         self.hi = hi
 
-    def matches(self, row: dict) -> bool:
+    def _tri(self, row: dict) -> Optional[bool]:
         v = row.get(self.column)
         if v is None or self.lo is None or self.hi is None:
-            return False
+            return None
         return self.lo <= v <= self.hi
 
 
@@ -109,10 +121,10 @@ class In(Predicate):
         self.column = column
         self.values = frozenset(v for v in values if v is not None)
 
-    def matches(self, row: dict) -> bool:
+    def _tri(self, row: dict) -> Optional[bool]:
         v = row.get(self.column)
         if v is None:
-            return False
+            return None
         return v in self.values
 
 
@@ -120,7 +132,7 @@ class IsNull(Predicate):
     def __init__(self, column: str):
         self.column = column
 
-    def matches(self, row: dict) -> bool:
+    def _tri(self, row: dict) -> Optional[bool]:
         return row.get(self.column) is None
 
 
@@ -128,7 +140,7 @@ class NotNull(Predicate):
     def __init__(self, column: str):
         self.column = column
 
-    def matches(self, row: dict) -> bool:
+    def _tri(self, row: dict) -> Optional[bool]:
         return row.get(self.column) is not None
 
 
@@ -136,8 +148,11 @@ class And(Predicate):
     def __init__(self, parts: list):
         self.parts = list(parts)
 
-    def matches(self, row: dict) -> bool:
-        return all(p.matches(row) for p in self.parts)
+    def _tri(self, row: dict) -> Optional[bool]:
+        results = [p._tri(row) for p in self.parts]
+        if any(r is False for r in results):
+            return False
+        return None if any(r is None for r in results) else True
 
     def _and_parts(self) -> list:
         return list(self.parts)
@@ -147,16 +162,20 @@ class Or(Predicate):
     def __init__(self, parts: list):
         self.parts = list(parts)
 
-    def matches(self, row: dict) -> bool:
-        return any(p.matches(row) for p in self.parts)
+    def _tri(self, row: dict) -> Optional[bool]:
+        results = [p._tri(row) for p in self.parts]
+        if any(r is True for r in results):
+            return True
+        return None if any(r is None for r in results) else False
 
 
 class Not(Predicate):
     def __init__(self, inner: Predicate):
         self.inner = inner
 
-    def matches(self, row: dict) -> bool:
-        return not self.inner.matches(row)
+    def _tri(self, row: dict) -> Optional[bool]:
+        inner = self.inner._tri(row)
+        return None if inner is None else (not inner)
 
 
 def eq(column: str, value: Any) -> Predicate:

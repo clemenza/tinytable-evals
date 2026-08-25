@@ -54,19 +54,19 @@ OPERATORS: tuple[Operator, ...] = (
         file="core.py",
         spec_section="NULL semantics (three-valued logic)",
         find=(
-            "    def matches(self, row: dict) -> bool:\n"
+            "    def _tri(self, row: dict) -> Optional[bool]:\n"
             "        v = row.get(self.column)\n"
             "        if v is None or self.value is None:\n"
-            "            return False\n"
+            "            return None\n"
             "        return _COMPARISON_OPS[self.op](v, self.value)\n"
         ),
         replace=(
-            "    def matches(self, row: dict) -> bool:\n"
+            "    def _tri(self, row: dict) -> Optional[bool]:\n"
             "        v = row.get(self.column)\n"
             "        if v is None and self.value is None:\n"
             "            return self.op == \"ne\"\n"
             "        if v is None or self.value is None:\n"
-            "            return False\n"
+            "            return None\n"
             "        return _COMPARISON_OPS[self.op](v, self.value)\n"
         ),
     ),
@@ -75,17 +75,17 @@ OPERATORS: tuple[Operator, ...] = (
         file="core.py",
         spec_section="NULL semantics (three-valued logic)",
         find=(
-            "    def matches(self, row: dict) -> bool:\n"
+            "    def _tri(self, row: dict) -> Optional[bool]:\n"
             "        v = row.get(self.column)\n"
             "        if v is None or self.lo is None or self.hi is None:\n"
-            "            return False\n"
+            "            return None\n"
             "        return self.lo <= v <= self.hi\n"
         ),
         replace=(
-            "    def matches(self, row: dict) -> bool:\n"
+            "    def _tri(self, row: dict) -> Optional[bool]:\n"
             "        v = row.get(self.column)\n"
             "        if v is None:\n"
-            "            return False\n"
+            "            return None\n"
             "        lo_ok = self.lo is None or self.lo <= v\n"
             "        hi_ok = self.hi is None or v <= self.hi\n"
             "        return lo_ok and hi_ok\n"

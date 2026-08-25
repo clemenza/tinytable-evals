@@ -17,7 +17,8 @@ copy of `clean/`, and never committed anywhere.
 ## Layout
 
 - **`SPEC.md`** - the sole arbiter of correct behavior. `clean/tinytable/`
-  is a reference implementation of everything in it.
+  is a reference implementation of everything in it - see `TRUTH_MODEL.md`
+  for why "reference" doesn't mean "assumed infallible."
 - **`clean/tinytable/`** - the reference (bug-free) engine: `core.py` (the
   underlying table/predicate/index/savepoint engine) and `sql.py` (the SQL
   parser and executor built on top of it).
@@ -63,9 +64,23 @@ copy of `clean/`, and never committed anywhere.
 - **`selfcheck.py`** - a standalone QA pass over this repo's own machinery
   (see "Why no golden tests" below).
 - **`oracle.py`** - the differential oracle: replays a `.test` corpus
-  against both `tinytable` and `sqlite3` (stdlib) and reports where their
+  against `tinytable` and a secondary backend (`sqlite3`, stdlib and the
+  default; or `postgres`, opt-in - issue #56) and reports where their
   results disagree, so a claimed defect can be checked against real SQL
-  semantics instead of argued about. See "The differential oracle" below.
+  semantics instead of argued about. See "The differential oracle" below
+  and `TRUTH_MODEL.md` for the full truth model this is one piece of.
+- **`adjudicate.py`** - PostgreSQL-backed adjudication of one baseline-vs-
+  agent disagreement (issue #57): settles whether a record failing against
+  both a mutant and the untouched baseline is a `reference_bug` (a bug in
+  `clean/` itself) or a genuine `false_alarm`, instead of `grade.py`
+  assuming the baseline is always right. See `TRUTH_MODEL.md`.
+- **`docker-compose.postgres.yml`** - the pinned (by version *and* digest)
+  PostgreSQL image `oracle.py --backend postgres`/`adjudicate.py`/CI all
+  use. **`truth_sources.json`** - every `SPEC.md` feature labeled
+  `postgres`/`invariant`/`none` per `TRUTH_MODEL.md`'s truth model.
+  **`sql-tests/property/`** - a small, stable, hand-authored corpus beyond
+  `clean/sql-tests/official/`, differential-checked against PostgreSQL on
+  every push (`.github/workflows/pg-oracle.yml`, issue #58).
 - **`trajectory.py`** / **`trajectory_schema.json`** - structured JSONL
   trajectory logging for one trial (issue #40). See "Trajectory logging"
   below.
@@ -150,31 +165,60 @@ suite, without ever writing down what would catch it.
 ## The differential oracle
 
 ```sh
-python3 oracle.py --root clean clean/sql-tests/official
+python3 oracle.py --root clean clean/sql-tests/official                       # sqlite3 - stdlib, zero-setup, default
+python3 oracle.py --root clean --backend postgres clean/sql-tests/official    # PostgreSQL - issue #56, see below
 ```
 
 `tinytable`'s current SQL surface (SPEC.md's grammar) is a subset of real
-SQL, so for any `.test` file, `sqlite3` is an independent, non-tinytable
-ground truth for what a `query` record's result *should* be. `oracle.py`
-replays a file's `statement`/`query` records against a fresh `tinytable`
-`Database` and a fresh `sqlite3 :memory:` connection side by side, applying
-each statement to the sqlite3 side only if `tinytable` itself accepted it
-(so tinytable's intentionally stricter column-type checking - see "Column
-Types" in SPEC.md - never desyncs the two engines' state), and compares
-every `query` record's actual result between the two - not against the
-file's own hardcoded expected block, which `run_sql_tests.py` already
-checks. `selfcheck.py` runs it against `clean/sql-tests/official/` as part
-of its own checks: zero disagreements there means `clean/tinytable` isn't
-merely self-consistent, it matches real SQL semantics.
+SQL, so for any `.test` file, a secondary backend is an independent,
+non-tinytable ground truth for what a `statement`/`query` record's result
+*should* be. `oracle.py` replays a file's `statement`/`query` records
+against a fresh `tinytable` `Database` and a fresh backend connection side
+by side and compares every result - not against the file's own hardcoded
+expected block, which `run_sql_tests.py` already checks. `selfcheck.py`
+runs both backends against `clean/sql-tests/official/` (the `postgres` one
+also against `sql-tests/property/`) as part of its own checks: zero
+disagreements means `clean/tinytable` isn't merely self-consistent, it
+matches real SQL semantics.
+
+Two backends:
+
+- **`sqlite` (default)** - stdlib, zero-setup, `#3`'s original oracle. Its
+  loose type affinity makes it a fast, always-available smoke check, but
+  it can't adjudicate anything sqlite3 itself doesn't enforce (e.g. it has
+  no real `BOOLEAN` type).
+- **`postgres` (opt-in - issue #56)** - needs `psycopg2` and a reachable
+  server (`docker-compose.postgres.yml`, pinned by version *and* digest).
+  A real, strictly-typed SQL engine catches real bugs sqlite3's oracle
+  can't: e.g. a mutated `type-check-isinstance-not-exact` defect that lets
+  an INTEGER wrongly through a `BOOLEAN` column agrees with sqlite3 (no
+  disagreement reported) but genuinely disagrees with PostgreSQL. Every
+  statement is now tried against the backend even when tinytable *rejects*
+  it (the original oracle's blind spot: a false-rejection bug was
+  previously invisible by construction) - see `oracle.py`'s module
+  docstring for the full design, its documented `INTENTIONAL_DIVERGENCES`
+  policy list, and `TRUTH_MODEL.md` for how this fits the wider truth
+  model (issue #55).
 
 This is `#3`'s differential-oracle piece, landed ahead of any of `#3`'s new
 feature milestones so each one gets it "for free": a milestone's own
 `.test` corpus runs through this same file unchanged, for as long as that
-feature stays inside SQL sqlite3 also implements. A future feature that
-goes beyond what sqlite3 supports (e.g. genuine MVCC/WAL semantics) is out
-of the oracle's reach by construction and needs its own operator-level
-proof instead, same as `selfcheck.py` already does for every current
+feature stays inside SQL either backend also implements. A future feature
+that goes beyond what PostgreSQL itself can adjudicate (e.g. genuine
+MVCC/WAL semantics) is out of the oracle's reach by construction and needs
+a local invariant instead (see `TRUTH_MODEL.md`'s "What PostgreSQL can't
+adjudicate"), same as `selfcheck.py` already does for every current
 operator (see "Why no golden tests" above).
+
+`grade.py --pg-adjudicate` (issue #57) is the other consumer of the
+PostgreSQL backend: when an agent's test fails against *both* a mutant and
+the untouched baseline, it asks PostgreSQL whether the baseline itself is
+wrong (`reference_bug` - doesn't count against the agent) rather than
+assuming the agent's test is simply mistaken (`false_alarm`, the original,
+still-default behavior). `.github/workflows/pg-oracle.yml` (issue #58) runs
+`oracle.py --backend postgres` against `clean/sql-tests/official/` and
+`sql-tests/property/` on every push that could change the baseline engine,
+blocking merge on a disagreement.
 
 ## Trajectory logging
 
