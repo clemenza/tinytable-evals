@@ -74,6 +74,22 @@ SELECT item || '!', qty * unit_price FROM prices
 widget!
 10.0
 
+# Division by zero is NULL, not an error (SPEC.md's "Expressions in
+# SELECT") - matches sqlite3's own `/`, but is a documented divergence from
+# real PostgreSQL, which raises instead (see oracle.py's QUERY_DIVERGENCES).
+# Exercising it here pins down the exemption itself: without it, this
+# record would wrongly read as a disagreement against a fully correct
+# clean/tinytable every time oracle.py --backend postgres runs.
+query I nosort
+SELECT qty / 0 FROM prices
+----
+NULL
+
+query R nosort
+SELECT unit_price / 0 FROM prices
+----
+NULL
+
 # Composite UNIQUE INDEX boundary: one NULL component exempts the whole row,
 # even when the other component repeats.
 statement ok

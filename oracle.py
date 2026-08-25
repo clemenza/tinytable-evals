@@ -304,6 +304,43 @@ def _match_divergence(tt_error: str) -> Optional[Divergence]:
     return None
 
 
+# QUERY_DIVERGENCES is the mirror-image list: not "tinytable rejects, backend
+# would accept" (INTENTIONAL_DIVERGENCES, matched against tinytable's own
+# error text), but "tinytable succeeds, the backend legitimately errors" for
+# a query record - matched against the *backend's* error text instead. Found
+# empirically while auditing which mutate.py operators the postgres backend
+# can actually adjudicate (see TRUTH_MODEL.md): `5/0` succeeds on tinytable
+# (SPEC.md: "Division by zero is NULL, not an error", matching sqlite3's own
+# `/`) but PostgreSQL raises `division by zero` - verified directly against
+# a live PostgreSQL 16 server, not assumed. Without this, oracle.py would
+# wrongly flag a division-by-zero query as a disagreement even against a
+# fully correct clean/tinytable. A direct consequence: the postgres backend
+# can never adjudicate the `expr-division-by-zero-returns-zero` mutant
+# either way (both the correct NULL and the mutant's 0 error out identically
+# on PostgreSQL's side) - that operator's ground truth is SPEC.md/the
+# official suite alone, labeled accordingly in truth_sources.json.
+QUERY_DIVERGENCES: list[Divergence] = [
+    Divergence(
+        name="division-by-zero-returns-null",
+        spec_section="Expressions in SELECT",
+        note=(
+            "SPEC.md: 'Division by zero is NULL, not an error' (matching sqlite3's own `/`) - real "
+            "PostgreSQL instead raises 'division by zero'. tinytable succeeding where the backend "
+            "raises this specific error is this divergence, not a bug - and means the postgres "
+            "backend can't adjudicate a division-by-zero-shaped defect at all, in either direction."
+        ),
+        matches=lambda backend_error: "division by zero" in backend_error.lower(),
+    ),
+]
+
+
+def _match_query_divergence(backend_error: str) -> Optional[Divergence]:
+    for divergence in QUERY_DIVERGENCES:
+        if divergence.matches(backend_error):
+            return divergence
+    return None
+
+
 @dataclass
 class Disagreement:
     line: int
@@ -485,12 +522,24 @@ class PostgresBackend:
             self._cur.execute("BEGIN")  # COMMIT ends the transaction - reopen it so SAVEPOINT keeps working
 
     def query(self, sql: str) -> list[tuple]:
+        # Wrapped in its own savepoint even though a SELECT never mutates
+        # anything: an error (e.g. division by zero - see
+        # QUERY_DIVERGENCES) leaves the whole transaction aborted until
+        # something rolls back, and a bare `self.con.rollback()` would
+        # discard every earlier statement's progress in this file, not just
+        # this one failed query - exactly the bug this savepoint avoids.
+        self._n += 1
+        name = f"_oracle_query_{self._n}"
+        self._cur.execute(f"SAVEPOINT {name}")
         try:
             self._cur.execute(_to_postgres_sql(sql))
-            return self._cur.fetchall()
+            rows = self._cur.fetchall()
         except self._psycopg2.Error as exc:
-            self.con.rollback()  # a SELECT never needs a savepoint of its own, but must clear the aborted-tx state
+            self._cur.execute(f"ROLLBACK TO SAVEPOINT {name}")
+            self._cur.execute(f"RELEASE SAVEPOINT {name}")
             raise BackendError(f"{type(exc).__name__}: {exc}".strip()) from exc
+        self._cur.execute(f"RELEASE SAVEPOINT {name}")
+        return rows
 
     def render_row(self, row: tuple, types: str) -> list[str]:
         return [_render(v) for v in row]
@@ -581,7 +630,9 @@ def compare_file(path: pathlib.Path, tinytable, backend_factory: Callable[[], ob
                 try:
                     backend_rows = backend.query(record.sql)
                 except BackendError as exc:
-                    disagreements.append(Disagreement(record.line, f"backend raised {exc}\n    sql: {record.sql}"))
+                    if _match_query_divergence(str(exc)) is None:
+                        disagreements.append(Disagreement(record.line, f"backend raised {exc}\n    sql: {record.sql}"))
+                    # else: a documented divergence (e.g. division by zero) - tinytable succeeding here is correct per SPEC.md, not a bug
                     continue
 
                 width = len(record.types)
