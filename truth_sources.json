@@ -19,7 +19,7 @@
     {
       "spec_section": "Expressions in SELECT",
       "source": "postgres",
-      "note": "arithmetic/concat/NULL-propagation are standard SQL; tinytable's exact operand typing is a documented intentional divergence, same as Column Types above."
+      "note": "arithmetic/concat/NULL-propagation are standard SQL; tinytable's exact operand typing is a documented intentional divergence, same as Column Types above. One sub-rule is a documented exception within this otherwise-postgres-adjudicable section: 'division by zero is NULL' (verified empirically that real PostgreSQL instead raises - oracle.py's QUERY_DIVERGENCES) means the postgres backend can never adjudicate the expr-division-by-zero-returns-zero mutant either way; that one operator's ground truth is SPEC.md/the official suite alone. Also confirmed empirically (see mutate.py's expr-arithmetic-bool-not-excluded): the sqlite backend alone would miss that specific defect (sqlite has no real BOOLEAN type, so it silently agrees with the mutant) - the postgres backend catches it, real evidence for why #56 added it."
     },
     {
       "spec_section": "ORDER BY / NULLS FIRST|LAST",

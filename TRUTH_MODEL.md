@@ -138,6 +138,52 @@ This is exactly the scenario #55 exists to catch: a baseline bug that would
 otherwise have kept silently poisoning every operator's "does the agent's
 test still pass on clean/?" check.
 
+## Operator-by-operator audit
+
+All 22 current `mutate.py` operators were checked directly against a live
+PostgreSQL 16 server (not just reasoned about): build the mutant, run a
+small hand-crafted probe targeting that operator's own diff, and check
+whether `oracle.py --backend postgres` reports a disagreement.
+
+- **21 of 22 are genuinely PostgreSQL-adjudicable** - a real PostgreSQL
+  server independently confirms the correct behavior and disagrees with
+  every one of these mutants, not just `sqlite`.
+- **`expr-division-by-zero-returns-zero` is not** - real PostgreSQL raises
+  `division by zero` for `5/0` (verified directly), where SPEC.md requires
+  tinytable to return `NULL` (matching sqlite3's own `/`). PostgreSQL
+  errors identically whether tinytable's own answer is correct (`NULL`) or
+  the mutant's (`0`), so it can never tell the two apart - this operator's
+  ground truth is `SPEC.md`/`clean/sql-tests/official/` alone, not the
+  postgres oracle. Now listed as `oracle.py`'s `QUERY_DIVERGENCES`, and
+  exercised directly by `sql-tests/property/edge_cases.test` so the
+  exemption itself stays regression-tested.
+- **`expr-arithmetic-bool-not-excluded` is a concrete case where `sqlite`
+  misses and `postgres` catches** - sqlite3 has no real `BOOLEAN` type, so
+  it silently agrees with the mutant (`TRUE + 1` succeeds on both); real
+  PostgreSQL rejects it (`operator does not exist: boolean + integer`),
+  matching SPEC.md. This is direct evidence for why issue #56 added the
+  postgres backend rather than trusting sqlite3 alone.
+- **`order-by-desc-breaks-stability`'s adjudication is real but not a
+  documented PostgreSQL guarantee** - a live PostgreSQL server does return
+  tied rows in insertion order under `ORDER BY ... DESC` for the small,
+  unindexed probe table tested here, matching tinytable's stable-sort
+  guarantee - but the SQL standard makes no tie-breaking promise at all
+  without an explicit secondary sort key, so this is empirically confirmed
+  *today*, not a contract PostgreSQL owes anyone. Recorded here rather than
+  silently treated the same as the fourteen features with an actual
+  standard-mandated guarantee (three-valued NULL logic, exact type
+  rejection, RESTRICT-only FOREIGN KEY, etc).
+
+This audit also caught two real bugs in this repository's own oracle
+implementation, both fixed as part of landing it:
+`PostgresBackend.query()` recovered from a query error with a bare
+`self.con.rollback()`, which discarded the *entire* file's progress (every
+earlier `CREATE TABLE`/`INSERT`) instead of just the one failed query -
+replaced with a savepoint scoped to that query alone, same pattern as
+every other backend method already uses. And `QUERY_DIVERGENCES` itself
+didn't exist yet - the division-by-zero gap above was found by writing
+the probe, not assumed.
+
 ## Non-goals
 
 - No second full reference/tinytable-equivalent implementation.
