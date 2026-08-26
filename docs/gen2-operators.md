@@ -18,12 +18,13 @@ before anything larger (a JOIN surface) gets built on top of it.
 
 ## The design: three families, not one pool
 
-12 new operators in `mutate.py`, each declaring `family` and `axes`:
+12 new operators in `mutate.py`, each declaring `family` and `axes` -
+plus one later addition to family M (see "Round 2" below), 13 total:
 
 | family | operators | what it is |
 | --- | --- | --- |
 | **S** | 4 | single-table compositional - the **control arm**. Harder than the original 22 by design, but confined to one table. |
-| **M** | 5 | multi-table, no JOIN - the arm that actually tests the hypothesis, using FK semantics `clean/tinytable` already implements. |
+| **M** | 6 | multi-table, no JOIN - the arm that actually tests the hypothesis, using FK semantics `clean/tinytable` already implements. |
 | **T** | 3 | transaction x multi-table - `SAVEPOINT`/`ROLLBACK TO` combined with multi-table state. |
 
 Keeping S as a control is the point: without it, a lower Gen2 kill rate
@@ -239,6 +240,56 @@ operator cannot support one, which is worth saying rather than dressing up.
 The shape-matched twins are the sharper read - if each M twin is harder
 than its S counterpart, the effect is unlikely to be operator design.
 
+## Round 2: one operator added after `clemenza/honeyrail#145`/`#146`'s rough pass
+
+`#64`'s own calibration protocol (5 trials/operator, PG-adjudicated) was
+never run before this addition - `clemenza/honeyrail#145` ran a cheaper,
+explicitly-rough n=1-per-operator pass instead, to get a go/no-go read
+before committing to the expensive version. Result: **every trial that
+finished within its 15-minute budget killed its mutant, 9/9, across all
+three families** - no false misses anywhere in the sample. `#146` retried
+the 3 timeouts once each budget-fixed pass and flipped 2 of them to killed
+too, leaving only one (`savepoint-existence-decided-by-first-table`,
+T-family) that timed out twice. Read plainly against this doc's own
+JOIN-gate contingency above: at n=1 this is not enough data to *decide*
+the gate, but it is squarely the "M/T still sit near 90-100%" case the
+gate's own text names, whose prescribed response is not "wait for #46",
+it's "keep iterating on `trigger_complexity`, hidden state, symptom
+invisibility, multi-step dependency, competing hypotheses and `spec_span`
+inside the existing SQL surface" - table count alone was never the
+hypothesis; #64's shape-matched twins exist precisely so a null result
+here wouldn't be surprising.
+
+`fk-referenced-side-ignores-column-identity` (family M, `spec_span` 3,
+`adversariality` `misleading-clue`) is one operator built to that brief,
+added directly rather than staged behind a fresh full calibration round -
+#46's empirical pass-rate binning is still what decides final level
+placement, this is a candidate for it, not a claim of having settled
+anything. Where the existing M operators (`fk-only-last-declared...`,
+`fk-incoming-only-first-referencing-table-checked`) each need exactly one
+FK relationship - matching fixture 7/23's shape - this one needs two: a
+referenced table with *two* independently `CREATE UNIQUE INDEX`'d columns,
+and two child tables, each referencing a different one. Dropping
+`_check_no_incoming_references`'s `fk.ref_column != column` guard makes a
+`DELETE`/`UPDATE` touching one of the parent's columns also consult FKs
+that target the *other* column, using the touched column's value against
+the wrong relationship - reachable only by deliberately engineering a
+value collision across the two columns' domains, since real data drawn
+from two different-purpose columns essentially never coincides by
+accident. Ordinary "delete a still-referenced parent" probing (fixture
+23's shape, and the existing M operators' shape) cannot reach this at all
+- it stays correct under a single relationship, which is what every prior
+operator's trigger constructs. It's also the first Gen2 M operator whose
+symptom is a raised exception rather than silence - deliberately, because
+the raised message ("foreign key constraint violated: ...") is completely
+plausible and correctly worded, so a tester who stumbles into it by
+accident is more likely to conclude their own test data was wrong than to
+suspect the engine. That reasoning is the `misleading-clue` declaration,
+not a claim that "exception" is inherently harder than "absent-error" -
+see selfcheck.py's operator-level check for the mechanical verification
+that it applies cleanly, stays valid Python, and passes
+`clean/sql-tests/official/` unmodified.
+
 ## Related
 
 - #63 / `docs/difficulty-dimensions.md` - the evidence and the
@@ -251,3 +302,7 @@ than its S counterpart, the effect is unlikely to be operator design.
   truth (`TRUTH_MODEL.md`).
 - `clemenza/honeyrail#130` (fixture 7), `#134` (fixture 23), `#136`
   (full 22-operator confirmation), `#137` (PG-adjudicated rerun, open).
+- `clemenza/honeyrail#145` (Gen2's rough n=1 pass: 9/12 killed, 25%
+  timeout rate vs. Gen1's ~5% - the ceiling didn't move on kill rate),
+  `#146` (retry: 2 of 3 timeouts flip to killed; the pycache leak fix,
+  `#70`/`#71` here). Both motivate "Round 2" above.
