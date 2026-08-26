@@ -1033,8 +1033,23 @@ def apply_operator(operator: Operator, tinytable_dir: Path) -> None:
 def build_mutant_tinytable(clean_tinytable_dir: Path, out_tinytable_dir: Path, operator: Operator) -> None:
     """Copy `clean_tinytable_dir` to `out_tinytable_dir` and apply
     `operator` to the copy.
+
+    Excludes `__pycache__/`: `clean_tinytable_dir` is gitignored, not
+    guaranteed empty, and readily accumulates real *.pyc files compiled
+    from the unmutated source - any direct `python3 run_sql_tests.py
+    --root clean` (or similar) against the canonical `clean/` checkout
+    writes them there as an unavoidable import side effect (this repo's own
+    README/#124's honeyrail-side fix), and this repo's own development
+    workflow does exactly that ("confirmed behaviorally killable against
+    clean/ ... run outside the repository", see #69's PR description). An
+    unfiltered copytree used to carry that pre-mutation-compiled bytecode
+    straight into the resulting seed-root, decompilable back into the exact
+    pre-mutation implementation - a real leak an exam-taking agent found
+    and spent most of its budget trying to exploit (clemenza/honeyrail#146).
+    Structurally the same class of issue clemenza/honeyrail#103 (P0) exists
+    to prevent, just via __pycache__ instead of a shared filesystem escape.
     """
     if out_tinytable_dir.exists():
         raise FileExistsError(f"{out_tinytable_dir} already exists")
-    shutil.copytree(clean_tinytable_dir, out_tinytable_dir)
+    shutil.copytree(clean_tinytable_dir, out_tinytable_dir, ignore=shutil.ignore_patterns("__pycache__"))
     apply_operator(operator, out_tinytable_dir)

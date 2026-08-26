@@ -72,6 +72,12 @@ two CLIs (build_seed_root.py, grade.py). Verifies:
       rates grouped by family - including reaching each of #64's three
       JOIN-gate verdicts on synthetic trial data.
 
+  (o) issue #70: build_mutant_tinytable() never copies clean/tinytable's
+      __pycache__/ into a seed-root, even when the canonical clean/ has one
+      populated (a real, gitignored-so-invisible leak of pre-mutation-
+      compiled bytecode - see check_seed_root_never_ships_precompiled_
+      bytecode()'s own docstring and clemenza/honeyrail#146).
+
 Deliberately does NOT check that any specific test can detect any specific
 operator's defect - doing so would mean writing a golden/answer test into
 this repository, which is exactly what issue #1 moves out of the public
@@ -86,6 +92,7 @@ Run standalone: `python3 selfcheck.py`. Exit code 0 iff every check passes.
 from __future__ import annotations
 
 import collections
+import compileall
 import difflib
 import json
 import pathlib
@@ -656,6 +663,41 @@ def check_operators(tmp: pathlib.Path) -> None:
             fail(f"official suite fails on operator {operator.id!r}'s mutant - defect is not sneaky:\n{output}")
 
 
+def check_seed_root_never_ships_precompiled_bytecode(tmp: pathlib.Path) -> None:
+    """clemenza/tinytable-evals#70 (found via clemenza/honeyrail#146's real
+    trial transcript): build_mutant_tinytable()'s shutil.copytree() used to
+    copy clean/tinytable/__pycache__/ verbatim whenever it happened to be
+    populated at build time - clean/tinytable is gitignored, not guaranteed
+    empty, and any direct `python3 run_sql_tests.py --root clean` against
+    the canonical checkout (this repo's own normal development workflow,
+    per #69's PR description) writes real .pyc files there as an import
+    side effect. A leaked .pyc compiled from the *unmutated* source, sitting
+    right next to the mutated .py in the agent's own workspace, is
+    decompilable back to the pre-mutation implementation - an exam-taking
+    agent found and nearly exploited exactly this in #146's real trial.
+    Same class of leak as clemenza/honeyrail#103 (P0), just via
+    __pycache__ instead of a shared-filesystem escape.
+
+    Reproduces the real trigger against a *temp copy* of clean/tinytable,
+    never the canonical CLEAN/ itself - this check must not leave its own
+    __pycache__ droppings in the checkout it's testing.
+    """
+    polluted_clean = tmp / "pycache-leak-check-clean"
+    shutil.copytree(CLEAN / "tinytable", polluted_clean)
+    compileall.compile_dir(str(polluted_clean), quiet=2)
+    if not any(polluted_clean.rglob("__pycache__")):
+        fail("check_seed_root_never_ships_precompiled_bytecode: setup didn't actually populate __pycache__ - not exercising anything")
+        return
+
+    mutant_out = tmp / "pycache-leak-check-mutant"
+    mutate.build_mutant_tinytable(polluted_clean, mutant_out, mutate.OPERATORS[0])
+    leaked = list(mutant_out.rglob("__pycache__"))
+    if leaked:
+        fail(f"build_mutant_tinytable() copied __pycache__/ into a seed-root - a leaked, pre-mutation-compiled answer key: {leaked}")
+    else:
+        ok("build_mutant_tinytable() never copies __pycache__/ into a seed-root, even when clean/tinytable's own copy has one")
+
+
 def check_gen2_operator_families_and_axes() -> None:
     """Issue #64: the Gen2 operator set has to stay a *comparison* - three
     named families, each with its difficulty prior written down - not one
@@ -1086,6 +1128,7 @@ def main() -> int:
         check_git_diff_reports_untracked_additions(tmp)
         check_sample_trajectory_covers_every_event_kind(tmp)
         check_operators(tmp)
+        check_seed_root_never_ships_precompiled_bytecode(tmp)
         check_calibrate_gen2_groups_by_family(tmp)
         check_build_seed_root_and_grade_end_to_end(tmp)
         check_grade_probabilistic_runs_end_to_end(tmp)
