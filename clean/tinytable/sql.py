@@ -723,7 +723,9 @@ def _tristate(node, row: dict) -> Optional[bool]:
         v = row.get(node.column)
         if v is None:
             return None
-        return v in node.values
+        if v in node.values:
+            return True
+        return None if any(x is None for x in node.values) else False
     if isinstance(node, NullCheck):
         is_null = row.get(node.column) is None
         return (not is_null) if node.negated else is_null
