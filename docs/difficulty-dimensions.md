@@ -156,3 +156,9 @@ controlled comparison (single-table vs. multi-table-without-JOIN vs.
 transaction-x-multi-table operator groups, kill rates reported per group)
 rather than assume multi-table state by itself will reproduce fixture 7's
 difficulty.
+
+That controlled comparison now exists: see `docs/gen2-operators.md` for
+#64's three-family operator set (single-table control vs. multi-table vs.
+transaction x multi-table, with three shape-matched S/M twins), the
+calibration protocol that will settle it, and the JOIN-gate decision it
+gates.

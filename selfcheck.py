@@ -64,6 +64,14 @@ two CLIs (build_seed_root.py, grade.py). Verifies:
       own docstring. Also skipped, not failed, without a reachable
       PostgreSQL.
 
+  (n) issue #64: the Gen2 operator set keeps its three-family comparison
+      structure (>= 10 operators, all of S/M/T populated, >= 4 multi-table
+      M and >= 2 transactional T), every Gen2 operator declares #44's
+      difficulty axes with its multi-object state recorded through the
+      existing `statefulness` axis, and calibrate_gen2.py reports kill
+      rates grouped by family - including reaching each of #64's three
+      JOIN-gate verdicts on synthetic trial data.
+
 Deliberately does NOT check that any specific test can detect any specific
 operator's defect - doing so would mean writing a golden/answer test into
 this repository, which is exactly what issue #1 moves out of the public
@@ -77,6 +85,7 @@ Run standalone: `python3 selfcheck.py`. Exit code 0 iff every check passes.
 
 from __future__ import annotations
 
+import collections
 import difflib
 import json
 import pathlib
@@ -647,6 +656,172 @@ def check_operators(tmp: pathlib.Path) -> None:
             fail(f"official suite fails on operator {operator.id!r}'s mutant - defect is not sneaky:\n{output}")
 
 
+def check_gen2_operator_families_and_axes() -> None:
+    """Issue #64: the Gen2 operator set has to stay a *comparison* - three
+    named families, each with its difficulty prior written down - not one
+    undifferentiated pool that happens to have grown. Checks the structure
+    #64's acceptance criteria call for, and that every Gen2 operator's
+    #44 axes are well-formed (mutate.DifficultyAxes validates the
+    vocabulary itself at import time; what's checked here is coverage).
+
+    Deliberately does NOT check that any family is harder than any other -
+    that's an empirical question for calibrate_gen2.py over real trial
+    data, not something to assert against a design prior (#44's own note
+    that the metadata is a hypothesis, #46's calibration authoritative).
+    """
+    by_family = mutate.operators_by_family()
+    gen2 = mutate.GEN2_OPERATORS
+
+    if len(gen2) >= 10:
+        ok(f"#64: {len(gen2)} Gen2 operators (>= 10)")
+    else:
+        fail(f"#64 wants >= 10 Gen2 operators, found {len(gen2)}")
+
+    missing = [family for family, ops in by_family.items() if not ops]
+    if missing:
+        fail(f"#64 wants all three operator families populated, empty: {missing}")
+    else:
+        ok("#64: all three operator families (S/M/T) are populated - the comparison structure is intact")
+
+    if len(by_family["M"]) >= 4:
+        ok(f"#64: {len(by_family['M'])} multi-table (family M) operators (>= 4)")
+    else:
+        fail(f"#64 wants >= 4 family-M operators, found {len(by_family['M'])}")
+
+    if len(by_family["T"]) >= 2:
+        ok(f"#64: {len(by_family['T'])} transaction x multi-table (family T) operators (>= 2)")
+    else:
+        fail(f"#64 wants >= 2 family-T operators, found {len(by_family['T'])}")
+
+    undeclared = [op.id for op in gen2 if op.axes is None or not op.notes.strip()]
+    if undeclared:
+        fail(f"these Gen2 operators declare no axes or no family-placement notes: {undeclared}")
+    else:
+        ok("every Gen2 operator declares #44's axes and says what its family placement rests on")
+
+    # Multi-table candidates must record their multi-object/multi-statement
+    # status through #44's existing `statefulness` axis rather than a
+    # parallel flag (#64: "no parallel taxonomy").
+    stateful_enough = {"multi-object", "transactional", "crash-recovery"}
+    too_flat = [
+        f"{op.id} ({op.family}, statefulness={op.axes.statefulness})"
+        for op in by_family["M"] + by_family["T"]
+        if op.axes.statefulness not in stateful_enough
+    ]
+    if too_flat:
+        fail(f"these family-M/T operators don't record multi-object state on the statefulness axis: {too_flat}")
+    else:
+        ok("every family-M/T operator records its multi-object state through the statefulness axis")
+
+    not_transactional = [op.id for op in by_family["T"] if op.axes.statefulness != "transactional"]
+    if not_transactional:
+        fail(f"these family-T operators don't declare statefulness='transactional': {not_transactional}")
+    else:
+        ok("every family-T operator declares transactional statefulness")
+
+    # #44 wants the axes actually spread, not all operators piled on one
+    # tier - a set that declares a single value everywhere can't inform
+    # #46's placement at all.
+    flat_axes = [
+        axis
+        for axis in ("trigger_complexity", "trigger_rarity", "symptom_visibility", "oracle_burden")
+        if len({getattr(op.axes, axis) for op in gen2}) < 2
+    ]
+    if flat_axes:
+        fail(f"every Gen2 operator declares the same value on these axes, so they carry no information: {flat_axes}")
+    else:
+        ok("Gen2's declared axes span more than one tier on each core axis")
+
+    visibilities = {op.axes.symptom_visibility for op in gen2}
+    if "exception" in visibilities and "absent-error" in visibilities:
+        ok("Gen2 spans both ends of symptom_visibility (a raised error and #63's silent absent-error tier)")
+    else:
+        fail(f"#44 wants operators at both ends of symptom_visibility, Gen2 declares only: {sorted(visibilities)}")
+
+
+def check_calibrate_gen2_groups_by_family(tmp: pathlib.Path) -> None:
+    """Issue #64: calibration results must be reported grouped by operator
+    family, and the JOIN gate decided by that comparison rather than by a
+    global average. Driven here with synthetic trial outcomes - no real
+    trial data and no test that could reveal any operator's defect, just
+    the reporting machinery.
+    """
+    work = tmp / "calibrate-gen2"
+    work.mkdir(parents=True, exist_ok=True)
+
+    def trials(rates: dict, per_operator: int = 5) -> pathlib.Path:
+        """One JSONL file where each family kills at its given rate."""
+        path = work / ("trials-" + "-".join(f"{k}{int(v * 100)}" for k, v in sorted(rates.items())) + ".jsonl")
+        lines = []
+        for operator in mutate.GEN2_OPERATORS:
+            kills = round(rates[operator.family] * per_operator)
+            for trial in range(per_operator):
+                lines.append(json.dumps({"operator_id": operator.id, "trial": trial, "killed": trial < kills}))
+        path.write_text("\n".join(lines) + "\n")
+        return path
+
+    def run(path: pathlib.Path, *extra: str) -> tuple[int, str, dict]:
+        out = work / (path.stem + ".json")
+        proc = subprocess.run(
+            [sys.executable, str(HERE / "calibrate_gen2.py"), "--trials", str(path), "--out", str(out), *extra],
+            capture_output=True,
+            text=True,
+            cwd=HERE,
+        )
+        report = json.loads(out.read_text()) if out.is_file() else {}
+        return proc.returncode, proc.stdout, report
+
+    # A control arm that stays near the ceiling while the multi-table arms
+    # drop: #64's "hypothesis holds" branch.
+    code, stdout, report = run(trials({"S": 1.0, "M": 0.4, "T": 0.4}))
+    families = report.get("families", {})
+    if set(families) == set(mutate.FAMILIES) and all(f["trials"] for f in families.values()):
+        ok("calibrate_gen2.py reports kill rates grouped by operator family (S/M/T), not as one global average")
+    else:
+        fail(f"calibrate_gen2.py did not report every family: {sorted(families)}")
+    if families.get("S", {}).get("mean_operator_kill_rate") == 1.0 and families.get("M", {}).get("mean_operator_kill_rate") == 0.4:
+        ok("calibrate_gen2.py's per-family kill rates match the trial data it was given")
+    else:
+        fail(f"calibrate_gen2.py mis-tallied per-family kill rates: {families}")
+    if report.get("join_gate", {}).get("verdict") == "hypothesis-supported":
+        ok("calibrate_gen2.py records a JOIN-gate verdict of 'hypothesis-supported' when M/T land materially below S")
+    else:
+        fail(f"expected 'hypothesis-supported', got {report.get('join_gate')}")
+    unreported = [op.id for op in mutate.GEN2_OPERATORS if op.id not in stdout]
+    if unreported:
+        fail(f"calibrate_gen2.py's report omits these operators: {unreported}")
+    else:
+        ok("calibrate_gen2.py's report names every Gen2 operator individually")
+
+    # Every arm at the current 100% ceiling: #64's "do not expand to JOIN"
+    # branch has to be reachable too, or the gate isn't a real gate.
+    code, _, report = run(trials({"S": 1.0, "M": 1.0, "T": 1.0}))
+    if report.get("join_gate", {}).get("verdict") == "hypothesis-not-supported":
+        ok("calibrate_gen2.py records 'hypothesis-not-supported' when every family sits at the ceiling")
+    else:
+        fail(f"expected 'hypothesis-not-supported', got {report.get('join_gate')}")
+
+    # Too few trials is neither verdict, and --strict says so with an exit code.
+    code, _, report = run(trials({"S": 1.0, "M": 0.5, "T": 0.5}, per_operator=2), "--strict")
+    if report.get("join_gate", {}).get("verdict") == "insufficient-data" and code != 0:
+        ok("calibrate_gen2.py --strict refuses to decide the JOIN gate on under-sampled data (nonzero exit)")
+    else:
+        fail(f"expected an 'insufficient-data' verdict and nonzero exit, got {code} and {report.get('join_gate')}")
+
+    # A driver that recorded only seeds must land on the same operator
+    # mapping build_seed_root.py used.
+    seed_records = [{"seed": seed, "killed": True} for seed in range(40)]
+    seed_path = work / "seeds.jsonl"
+    seed_path.write_text("\n".join(json.dumps(r) for r in seed_records) + "\n")
+    _, _, report = run(seed_path)
+    expected = collections.Counter(mutate.select_operator(seed).id for seed in range(40))
+    actual = {oid: entry["trials"] for oid, entry in report["per_operator"].items() if entry["trials"]}
+    if actual == dict(expected):
+        ok("calibrate_gen2.py resolves seed-only trial records through the same select_operator mapping as build_seed_root.py")
+    else:
+        fail(f"seed-only records resolved to {actual}, expected {dict(expected)}")
+
+
 def check_selection_is_deterministic_and_covers_all_operators() -> None:
     for seed in (0, 1, 2, 42, 12345, -7, 999999):
         first = mutate.select_operator(seed)
@@ -903,6 +1078,7 @@ def main() -> int:
     check_admissibility_detects_violations()
     check_grade_kind_classification()
     check_selection_is_deterministic_and_covers_all_operators()
+    check_gen2_operator_families_and_axes()
     with tempfile.TemporaryDirectory(prefix="tinytable-evals-selfcheck-") as td:
         tmp = pathlib.Path(td)
         check_run_sql_tests_admissibility_flag(tmp)
@@ -910,6 +1086,7 @@ def main() -> int:
         check_git_diff_reports_untracked_additions(tmp)
         check_sample_trajectory_covers_every_event_kind(tmp)
         check_operators(tmp)
+        check_calibrate_gen2_groups_by_family(tmp)
         check_build_seed_root_and_grade_end_to_end(tmp)
         check_grade_probabilistic_runs_end_to_end(tmp)
         check_pg_adjudication(tmp)

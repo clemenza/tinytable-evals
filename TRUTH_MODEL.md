@@ -140,8 +140,8 @@ test still pass on clean/?" check.
 
 ## Operator-by-operator audit
 
-All 22 current `mutate.py` operators were checked directly against a live
-PostgreSQL 16 server (not just reasoned about): build the mutant, run a
+All 22 of the original `mutate.py` operators were checked directly against
+a live PostgreSQL 16 server (not just reasoned about): build the mutant, run a
 small hand-crafted probe targeting that operator's own diff, and check
 whether `oracle.py --backend postgres` reports a disagreement.
 
@@ -173,6 +173,24 @@ whether `oracle.py --backend postgres` reports a disagreement.
   silently treated the same as the fourteen features with an actual
   standard-mandated guarantee (three-valued NULL logic, exact type
   rejection, RESTRICT-only FOREIGN KEY, etc).
+
+### Gen2 operators (#64) are not covered by this audit yet
+
+The twelve Gen2 operators added by issue #64 have not been through this
+audit. Each declares an `oracle_burden` (`mutate.py`'s difficulty axes,
+tabulated in `docs/gen2-operators.md`), but that axis records how much work
+*settling* the defect costs the truth model, not whether a live PostgreSQL
+server independently disagrees with the mutant - which is what the audit
+above establishes and what only a probe against a real server can. On the
+design claim: eleven of the twelve target features `truth_sources.json`
+already marks `postgres` (constraints, NULL semantics, savepoints), so they
+are expected to be PG-adjudicable; the twelfth,
+`savepoint-existence-decided-by-first-table`, already declares itself
+`local-invariant`, because its trigger depends on tinytable's per-table
+savepoint model rather than anything PostgreSQL's transactional DDL
+reproduces. Re-running the audit over the Gen2 set (build each mutant,
+write a probe, diff against a live PostgreSQL 16 server) is the way to turn
+those expectations into audited facts.
 
 This audit also caught two real bugs in this repository's own oracle
 implementation, both fixed as part of landing it:

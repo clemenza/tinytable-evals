@@ -54,7 +54,18 @@ copy of `clean/`, and never committed anywhere.
 - **`mutate.py`** - the mutation operator library: a fixed set of
   single-hunk, SPEC-violating edits to `clean/tinytable`, each targeting
   one specific behavioral guarantee from SPEC.md, plus `select_operator(seed)`
-  to deterministically pick one by seed.
+  to deterministically pick one by seed. Its Gen2 operators (issue #64)
+  also declare a `family` (S/M/T - which arm of a controlled
+  compositional-difficulty experiment they belong to) and `axes` (issue
+  #44's difficulty metadata) - see "The Gen2 operator experiment" below.
+- **`calibrate_gen2.py`** - turns per-trial kill outcomes into that
+  experiment's report: kill rates per operator and **grouped by family**,
+  plus #64's JOIN-gate decision rule applied mechanically.
+- **`docs/`** - the design write-ups the operator work rests on:
+  `difficulty-dimensions.md` (issue #63's dissection of the one operator
+  the baseline doesn't always kill) and `gen2-operators.md` (issue #64's
+  experiment design, declared axes, calibration protocol and JOIN-gate
+  record).
 - **`build_seed_root.py`** / **`grade.py`** - the two CLIs described below.
 - **`task-prompt.md`** - the standing instructions an exam-taking agent is
   given inside a seed-root: read `SPEC.md`, black-box test `tinytable/`
@@ -146,6 +157,39 @@ operator or seed produced `DIR/tinytable/`:
 4. Writes `score.json` (including a `per_run` breakdown) and prints
    `SCORE_JSON: {...}`; exit 0 iff `killed and false_alarms == 0 and
    contract_ok`.
+
+## The Gen2 operator experiment
+
+The original 22 operators are killed 100% of the time by the baseline
+profile/model, with one exception (`clemenza/honeyrail#130`/`#136`), and
+`docs/difficulty-dimensions.md` shows the obvious explanations for that
+exception - multi-table, multi-statement, silent symptom - are each
+necessary but not sufficient. Issue #64's Gen2 set is the controlled
+experiment that follows: 12 operators split into three families that are
+compared against each other rather than pooled -
+
+- **S** (4) single-table compositional, the *control* arm;
+- **M** (5) multi-table without JOIN, exercising FOREIGN KEY semantics
+  across two or more tables;
+- **T** (3) transaction x multi-table, `SAVEPOINT`/`ROLLBACK TO` combined
+  with multi-table state.
+
+Three of the S operators are shape-matched twins of an M operator - the
+same source-level slip on a single-table constraint and on a cross-table
+one - so the comparison holds bug design fixed and varies only table count.
+
+Trials themselves run in `clemenza/honeyrail`; here, `calibrate_gen2.py`
+consumes their outcomes:
+
+```sh
+python3 calibrate_gen2.py --trials trials.jsonl --out calibration.json
+```
+
+It reports per-operator and per-family kill rates (never only a global
+average, which would hide exactly the comparison the experiment exists to
+make) and applies #64's JOIN-gate rule, including refusing to decide on
+under-sampled data. `docs/gen2-operators.md` has the full design, the
+declared axes and the JOIN-gate decision record.
 
 ## Why no golden tests
 
