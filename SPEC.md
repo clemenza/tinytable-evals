@@ -165,9 +165,17 @@ matches; `age != 30` does **not** silently mean "every age other than 30,
 including unknown ones." A caller who wants that must write
 `age != 30 OR age IS NULL` explicitly.
 
-`IN (...)`: if the list contains `NULL`, that `NULL` is inert - it can
-never cause a `NULL`-valued row to match. `IS NULL` is the only way to
-match `NULL`.
+`IN (...)`: `x IN (a, b, ...)` is shorthand for `x = a OR x = b OR ...`,
+and inherits three-valued logic from `=` accordingly. A `NULL` in the list
+can never itself match - `IS NULL` is the only way to match `NULL` - but
+its presence still participates in the `OR`: if `x` is non-`NULL` and
+doesn't equal any non-`NULL` member, `x IN (...)` is `UNKNOWN`, not
+`FALSE`, whenever the list contains a `NULL`. A plain `WHERE` can't see the
+difference (`UNKNOWN` excludes a row exactly like `FALSE` does), but two
+places can: `NOT (x IN (...))` stays `UNKNOWN` rather than flipping to
+`TRUE`, so `NOT (x IN (a, NULL))` can never match any row whose value isn't
+`a` (the classic SQL trap - same as PostgreSQL); and a `CHECK` referencing
+`IN (...)` treats `UNKNOWN` as passing, not failing (see "Constraints").
 
 A column **never written on a given row** behaves identically to that
 column holding `NULL`, for every rule above.

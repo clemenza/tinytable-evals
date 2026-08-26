@@ -43,6 +43,15 @@ SELECT tag FROM t WHERE b IN (10, NULL)
 ----
 x
 
+# NOT (... IN (...)) with a NULL in the list is the classic SQL trap: it
+# can never match any row, because a non-matching non-NULL value is
+# UNKNOWN (not FALSE) whenever the list contains NULL, and NOT UNKNOWN
+# stays UNKNOWN - not FALSE flipping to TRUE. y's b=20 doesn't equal 10,
+# but that doesn't make `NOT (b IN (10, NULL))` true for it (issue #62).
+query T rowsort
+SELECT tag FROM t WHERE NOT (b IN (10, NULL))
+----
+
 # NOT on a NULL comparison stays NULL/unknown, not flipped to TRUE.
 query T rowsort
 SELECT tag FROM t WHERE NOT (a = 1)
@@ -128,3 +137,17 @@ SELECT k FROM ord ORDER BY k NULLS FIRST LIMIT 2 OFFSET 1
 ----
 1
 2
+
+# CHECK referencing IN (...) with a NULL in the list: a value that matches
+# no non-NULL member is UNKNOWN, not FALSE, so CHECK must accept it (CHECK
+# only rejects a definite FALSE - see "Constraints"). Issue #62: this used
+# to be a reference_bug against real PostgreSQL (a definite-FALSE, wrongly-
+# rejecting reading of the same rule).
+statement ok
+CREATE TABLE ck (x INTEGER, CHECK (x IN (1, 2, NULL)))
+
+statement ok
+INSERT INTO ck VALUES (1)
+
+statement ok
+INSERT INTO ck VALUES (5)

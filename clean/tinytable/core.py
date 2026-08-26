@@ -113,19 +113,30 @@ class Between(Predicate):
 
 
 class In(Predicate):
-    """row[column] is one of `values`. NULL never matches, even if None is
-    included in `values` - use is_null() for that.
+    """row[column] is one of `values` - three-valued, same as `x = a OR x = b
+    OR ...`. NULL never matches (use is_null() for that), but a NULL
+    *inside* `values` still participates in that OR: a row whose value
+    doesn't equal any non-NULL member is UNKNOWN (not FALSE) whenever
+    `values` contains NULL. That distinction is invisible to a plain WHERE
+    filter (UNKNOWN excludes a row exactly like FALSE does) but matters
+    wherever this predicate's tri-state feeds into NOT/AND/OR (`NOT IN` with
+    a NULL in the list can never match anything) or a CHECK constraint
+    (UNKNOWN passes, only definite FALSE fails).
     """
 
     def __init__(self, column: str, values: Iterable[Any]):
         self.column = column
+        values = list(values)
         self.values = frozenset(v for v in values if v is not None)
+        self.has_null = any(v is None for v in values)
 
     def _tri(self, row: dict) -> Optional[bool]:
         v = row.get(self.column)
         if v is None:
             return None
-        return v in self.values
+        if v in self.values:
+            return True
+        return None if self.has_null else False
 
 
 class IsNull(Predicate):
