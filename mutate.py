@@ -48,6 +48,12 @@ target), so the S-vs-M kill-rate comparison holds bug design fixed and
 varies only table count. See `docs/gen2-operators.md` for the full design,
 the per-operator axis declarations, and the calibration protocol whose
 results - not this metadata - decide final placement (#46).
+
+`fk-referenced-side-ignores-column-identity` (family M) is a later,
+single-operator addition responding to clemenza/honeyrail#145's rough n=1
+pass (every trial that finished within budget still killed its mutant,
+9/9) and #146's retry (2 of 3 timeouts flip to killed) - see
+`docs/gen2-operators.md`'s "Round 2" section for the full rationale.
 """
 
 from __future__ import annotations
@@ -857,6 +863,62 @@ OPERATORS: tuple[Operator, ...] = (
         ),
         replace=(
             "                    self._check_check_constraints(stmt.table, new_row)\n"
+        ),
+    ),
+    Operator(
+        id="fk-referenced-side-ignores-column-identity",
+        file="sql.py",
+        spec_section="Constraints: NOT NULL, CHECK, FOREIGN KEY",
+        family="M",
+        axes=DifficultyAxes(
+            trigger_complexity="operation-sequence",
+            trigger_rarity="constructed-negative",
+            symptom_visibility="exception",
+            oracle_burden="trivial-diff",
+            statefulness="multi-object",
+            spec_span=3,
+            adversariality="misleading-clue",
+        ),
+        notes=(
+            "clemenza/honeyrail#145's rough n=1 pass found every Gen2 trial "
+            "that finished within budget still kills its mutant (9/9), and "
+            "#146's retry flips 2 of the 3 timeouts to killed too - the "
+            "single-relationship 'shape A/B' M operators above are "
+            "apparently not what breaks the ceiling on their own. This "
+            "operator needs a second, independently-unique column on the "
+            "referenced table (two CREATE UNIQUE INDEXes, not one) and a "
+            "second child table referencing the other column, which no "
+            "existing operator's trigger requires - "
+            "fk-incoming-only-first-referencing-table-checked's shape A is "
+            "two tables referencing the *same* column. "
+            "_check_no_incoming_references drops its `fk.ref_column != "
+            "column` guard, so deleting or re-pointing a row's column A "
+            "also (wrongly) checks every FK that targets a *different* "
+            "column B on the same table, using column A's outgoing value "
+            "against column B's referencing FKs. Ordinary 'delete a "
+            "still-referenced parent' probing (fixture 23's shape, single "
+            "relationship) can't reach this at all - it needs two "
+            "relationships on two different columns, and a deliberately "
+            "engineered value collision between them, to produce an "
+            "observable wrong answer. The direction is a false rejection, "
+            "not a false acceptance (a legitimate DELETE/UPDATE raises "
+            "'foreign key constraint violated' when it shouldn't) - the "
+            "one Gen2 M operator whose symptom is a raised, correctly "
+            "worded, on-topic-sounding error rather than silence, which is "
+            "exactly what makes it adversarial: the error message reads as "
+            "legitimate, so a tester who stumbles into it without meaning "
+            "to is more likely to conclude their own test data was wrong "
+            "than to suspect an engine defect."
+        ),
+        find=(
+            "        for referencing_table, fk in self._incoming_foreign_keys(table):\n"
+            "            if fk.ref_column != column:\n"
+            "                continue\n"
+            "            if self.table(referencing_table).select(core.eq(fk.column, value)).count():\n"
+        ),
+        replace=(
+            "        for referencing_table, fk in self._incoming_foreign_keys(table):\n"
+            "            if self.table(referencing_table).select(core.eq(fk.column, value)).count():\n"
         ),
     ),
     # -----------------------------------------------------------------
