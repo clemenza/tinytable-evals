@@ -53,7 +53,12 @@ import urllib.error
 import urllib.request
 
 ENGINE_SERVICE_URL_ENV = "ENGINE_SERVICE_URL"
-REQUEST_TIMEOUT_SECONDS = 60
+# Whole-request budget for however many files this call sends in one POST -
+# must exceed engine_service.py's own per-file --timeout (default 120s)
+# times a plausible file count in one call, not just a single file's worth,
+# since the server processes every file in the request sequentially before
+# responding.
+REQUEST_TIMEOUT_SECONDS = 300
 
 
 def collect_test_files(root: pathlib.Path, paths: list[str]) -> list[pathlib.Path]:
@@ -95,14 +100,26 @@ def render_and_exit_code(results: list[dict]) -> tuple[str, int]:
     same visual style as run_sql_tests.py's own CLI output - FAIL/ok per
     file, indented failure/skip lines - so the agent's own iteration loop
     reads exactly like it would against a real in-process run_sql_tests.py.
+
+    A `timed_out: true` result (engine_service.py's own per-file execution
+    timeout) is rendered as TIMEOUT, distinct from FAIL - it means
+    unscorable, not "this file's assertions failed", matching grade.py's
+    own timeout contract. Counted toward the nonzero exit code (the agent
+    must not treat it as a pass) but kept out of the plain failure tally so
+    the summary line doesn't misreport it as an assertion failure.
     """
     lines: list[str] = []
     total_failures = 0
     total_skips = 0
+    total_timeouts = 0
     for result in results:
         path = result["path"]
         failures = result["failures"]
         skips = result["skips"]
+        if result.get("timed_out"):
+            total_timeouts += 1
+            lines.append(f"TIMEOUT {path} (exceeded the engine-service's execution timeout - unscorable, not a failure)")
+            continue
         if failures:
             total_failures += len(failures)
             lines.append(f"FAIL {path} ({len(failures)} failure(s))")
@@ -117,8 +134,13 @@ def render_and_exit_code(results: list[dict]) -> tuple[str, int]:
                 lines.append(f"  SKIP line {line}: {message}")
 
     lines.append("")
-    if total_failures:
-        lines.append(f"{total_failures} failure(s) across {len(results)} file(s)")
+    if total_failures or total_timeouts:
+        parts = []
+        if total_failures:
+            parts.append(f"{total_failures} failure(s)")
+        if total_timeouts:
+            parts.append(f"{total_timeouts} timeout(s)")
+        lines.append(f"{' and '.join(parts)} across {len(results)} file(s)")
         exit_code = 1
     else:
         extra = f" ({total_skips} record(s) skipped - grammar directives without runtime support yet)" if total_skips else ""
