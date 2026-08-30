@@ -78,6 +78,14 @@ two CLIs (build_seed_root.py, grade.py). Verifies:
       compiled bytecode - see check_seed_root_never_ships_precompiled_
       bytecode()'s own docstring and clemenza/honeyrail#146).
 
+  (p) clemenza/honeyrail#168: engine_service.py's HTTP /run endpoint,
+      driven end to end through oracle_run_sql_tests.py (the same file
+      that ships into an agent's agentRoot as its run_sql_tests.py
+      stand-in), reaches the same pass/fail verdict as running
+      run_sql_tests.py directly against `clean/` - for both a clean pass
+      and a deliberately failing record - with neither process ever
+      importing the other's `tinytable`.
+
 Deliberately does NOT check that any specific test can detect any specific
 operator's defect - doing so would mean writing a golden/answer test into
 this repository, which is exactly what issue #1 moves out of the public
@@ -97,11 +105,16 @@ import difflib
 import json
 import pathlib
 import py_compile
+import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 
 import admissibility
 import build_seed_root
@@ -120,6 +133,8 @@ BUILD_SEED_ROOT = HERE / "build_seed_root.py"
 GRADE = HERE / "grade.py"
 ORACLE = HERE / "oracle.py"
 SAMPLE_TRAJECTORY = HERE / "sample_trajectory.py"
+ENGINE_SERVICE = HERE / "engine_service.py"
+ORACLE_RUN_SQL_TESTS = HERE / "oracle_run_sql_tests.py"
 
 _failures: list[str] = []
 
@@ -148,6 +163,94 @@ def check_official_suite_passes_on_clean() -> None:
         ok("official suite passes on clean")
     else:
         fail(f"official suite fails on clean:\n{output}")
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _wait_for_health(base_url: str, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"{base_url}/health", timeout=1) as resp:
+                if resp.status == 200:
+                    return True
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(0.1)
+    return False
+
+
+def check_engine_service_end_to_end(tmp: pathlib.Path) -> None:
+    """clemenza/honeyrail#168: engine_service.py (server, owns the real
+    `tinytable`) driven through oracle_run_sql_tests.py (thin client,
+    never imports `tinytable` at all - see that file's own module
+    docstring) reaches the same verdict as running run_sql_tests.py
+    directly - for a passing suite and for a deliberately failing record.
+    This is the process-boundary pair honeyrail#168's `engineAccess=oracle`
+    mode ships into an agent's agentRoot / a separate container,
+    respectively; here they're both run as plain host subprocesses talking
+    over a loopback HTTP port, since this file has no container runtime -
+    see honeyrail's scripts/tinytable-engine-service.ts for the actual
+    Docker orchestration this pair runs under in a real trial.
+    """
+    port = _free_port()
+    proc = subprocess.Popen(
+        [sys.executable, "-B", str(ENGINE_SERVICE), "--root", str(CLEAN), "--host", "127.0.0.1", "--port", str(port)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        if not _wait_for_health(base_url):
+            if proc.poll() is not None:
+                out, err = proc.communicate(timeout=2)
+                fail(f"engine_service.py exited before becoming healthy (stdout={out!r} stderr={err!r})")
+            else:
+                fail(f"engine_service.py never became healthy on {base_url} within the timeout")
+            return
+
+        client_env = {**os.environ, "ENGINE_SERVICE_URL": base_url}
+
+        direct_passed, direct_output = run_suite(CLEAN, OFFICIAL)
+        client_proc = subprocess.run(
+            [sys.executable, "-B", str(ORACLE_RUN_SQL_TESTS), "--root", str(CLEAN), "sql-tests/official"],
+            capture_output=True, text=True, env=client_env,
+        )
+        if direct_passed and client_proc.returncode == 0:
+            ok("engine-service + oracle_run_sql_tests.py: official suite passes through the HTTP boundary, matching a direct run_sql_tests.py run")
+        else:
+            fail(
+                "engine-service + oracle_run_sql_tests.py: official-suite verdict diverged from a direct run - "
+                f"direct passed={direct_passed}, client exit={client_proc.returncode}\n"
+                f"direct output:\n{direct_output}\nclient stdout:\n{client_proc.stdout}\nclient stderr:\n{client_proc.stderr}"
+            )
+
+        fail_test = tmp / "engine-service-fail.test"
+        fail_test.write_text("statement error\nCREATE TABLE engine_service_check (x INTEGER)\n")
+
+        direct_fail_passed, direct_fail_output = run_suite(CLEAN, fail_test)
+        client_fail_proc = subprocess.run(
+            [sys.executable, "-B", str(ORACLE_RUN_SQL_TESTS), "--root", str(tmp), "engine-service-fail.test"],
+            capture_output=True, text=True, env=client_env,
+        )
+        if (not direct_fail_passed) and client_fail_proc.returncode == 1 and "expected to raise but succeeded" in client_fail_proc.stdout:
+            ok("engine-service + oracle_run_sql_tests.py: a deliberately failing record is caught through the HTTP boundary too, same as a direct run")
+        else:
+            fail(
+                "engine-service + oracle_run_sql_tests.py: deliberately-failing record was not caught correctly - "
+                f"direct passed={direct_fail_passed}, client exit={client_fail_proc.returncode}\n"
+                f"direct output:\n{direct_fail_output}\nclient stdout:\n{client_fail_proc.stdout}\nclient stderr:\n{client_fail_proc.stderr}"
+            )
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
 
 
 def check_truth_sources_labels_are_well_formed() -> None:
@@ -1135,6 +1238,7 @@ def main() -> int:
         check_pg_adjudication(tmp)
         check_grade_trajectory_log(tmp)
         check_official_tests_dont_leak_seeded_defect_location(tmp)
+        check_engine_service_end_to_end(tmp)
 
     print()
     if _failures:
