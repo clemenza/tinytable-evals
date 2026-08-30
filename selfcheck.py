@@ -244,6 +244,112 @@ def check_engine_service_end_to_end(tmp: pathlib.Path) -> None:
                 f"direct passed={direct_fail_passed}, client exit={client_fail_proc.returncode}\n"
                 f"direct output:\n{direct_fail_output}\nclient stdout:\n{client_fail_proc.stdout}\nclient stderr:\n{client_fail_proc.stderr}"
             )
+
+        # honeyrail#168 exploration found zero coverage of --sim-seed
+        # reaching engine_service.py at all - a regression dropping it from
+        # oracle_run_sql_tests.py's wire body would still pass every check
+        # above. A *behavioral* divergence test (same file, two seeds,
+        # different verdict) isn't constructible yet: tinytable itself isn't
+        # wired to substrate.py's seeded VFS (crash/restart/checkpoint) until
+        # #11's WAL milestone lands - confirmed empirically, same file with
+        # `crash torn` passes identically under every --sim-seed tried
+        # directly against run_sql_tests.py. So this checks what's actually
+        # checkable today: a nonzero seed is accepted and threaded through
+        # without erroring (proves the value survives JSON encode/decode and
+        # engine_service.py's own int-type check), and the 400 validation
+        # paths - genuinely untested before this - actually reject malformed
+        # input instead of 500ing or hanging.
+        seed_ok_test = tmp / "engine-service-seed-ok.test"
+        seed_ok_test.write_text("statement ok\nCREATE TABLE seed_check (x INTEGER)\n")
+        seed_client_proc = subprocess.run(
+            [sys.executable, "-B", str(ORACLE_RUN_SQL_TESTS), "--root", str(tmp), "--sim-seed", "424242", "engine-service-seed-ok.test"],
+            capture_output=True, text=True, env=client_env,
+        )
+        if seed_client_proc.returncode == 0 and "all 1 file(s) passed" in seed_client_proc.stdout:
+            ok("engine-service + oracle_run_sql_tests.py: a nonzero --sim-seed is accepted and threaded through without erroring")
+        else:
+            fail(
+                "engine-service + oracle_run_sql_tests.py: a nonzero --sim-seed broke the request - "
+                f"exit={seed_client_proc.returncode}\nstdout:\n{seed_client_proc.stdout}\nstderr:\n{seed_client_proc.stderr}"
+            )
+
+        def _post_raw(body: dict) -> tuple[int, dict]:
+            request = urllib.request.Request(
+                f"{base_url}/run", data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    return response.status, json.loads(response.read())
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read())
+
+        status, parsed = _post_raw({"files": {"x.test": "statement ok\nCREATE TABLE t (x INTEGER)\n"}, "sim_seed": "not-an-int"})
+        if status == 400 and "error" in parsed:
+            ok("engine-service: a non-integer sim_seed is rejected with 400, not a 500 or a silent default-0")
+        else:
+            fail(f"engine-service: a non-integer sim_seed should be rejected with 400, got status={status} body={parsed}")
+
+        status, parsed = _post_raw({"files": {"../escape.test": "statement ok\nCREATE TABLE t (x INTEGER)\n"}})
+        if status == 400 and "error" in parsed:
+            ok("engine-service: a path-traversal relpath ('../...') is rejected with 400")
+        else:
+            fail(f"engine-service: a path-traversal relpath should be rejected with 400, got status={status} body={parsed}")
+
+        status, parsed = _post_raw({"files": {}})
+        if status == 400 and "error" in parsed:
+            ok("engine-service: an empty files object is rejected with 400")
+        else:
+            fail(f"engine-service: an empty files object should be rejected with 400, got status={status} body={parsed}")
+
+        # honeyrail#168: a runaway agent-authored test (or a mutant-induced
+        # infinite loop) must be killed cleanly within the configured
+        # per-file timeout, not hang the shared engine-service process for
+        # the rest of the trial. `repeat N { ... }` with a large N is a
+        # reliable way to make tinytable (a plain, unoptimized Python
+        # interpreter loop) spin for longer than any short timeout, without
+        # needing a real mutant.
+        runaway_test = tmp / "engine-service-runaway.test"
+        runaway_test.write_text(
+            "statement ok\nCREATE TABLE runaway (x INTEGER)\n\n"
+            "repeat 5000000 {\nstatement ok\nINSERT INTO runaway VALUES (1)\n\n"
+            "statement ok\nDELETE FROM runaway WHERE x = 1\n}\n"
+        )
+        timeout_port = _free_port()
+        timeout_proc = subprocess.Popen(
+            [sys.executable, "-B", str(ENGINE_SERVICE), "--root", str(CLEAN), "--host", "127.0.0.1", "--port", str(timeout_port), "--timeout", "2"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        timeout_base_url = f"http://127.0.0.1:{timeout_port}"
+        try:
+            if not _wait_for_health(timeout_base_url):
+                fail("engine-service (--timeout 2 instance) never became healthy")
+            else:
+                started = time.monotonic()
+                timeout_client_proc = subprocess.run(
+                    [sys.executable, "-B", str(ORACLE_RUN_SQL_TESTS), "--root", str(tmp), "engine-service-runaway.test"],
+                    capture_output=True, text=True, env={**os.environ, "ENGINE_SERVICE_URL": timeout_base_url},
+                )
+                elapsed = time.monotonic() - started
+                if (
+                    timeout_client_proc.returncode == 1
+                    and "TIMEOUT" in timeout_client_proc.stdout
+                    and elapsed < 30
+                ):
+                    ok(f"engine-service: a runaway repeat-loop is killed within its --timeout (2s), reported as TIMEOUT not a hang (took {elapsed:.1f}s)")
+                else:
+                    fail(
+                        "engine-service: a runaway repeat-loop was not cleanly timed out - "
+                        f"exit={timeout_client_proc.returncode} elapsed={elapsed:.1f}s\n"
+                        f"stdout:\n{timeout_client_proc.stdout}\nstderr:\n{timeout_client_proc.stderr}"
+                    )
+        finally:
+            timeout_proc.terminate()
+            try:
+                timeout_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                timeout_proc.kill()
+                timeout_proc.wait(timeout=5)
     finally:
         proc.terminate()
         try:
